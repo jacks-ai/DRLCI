@@ -129,11 +129,11 @@ class Coach:
             drugs = drugs.long().cuda()
             genes = genes.long().cuda()
             labels = labels.long().cuda()
-            ceLoss, sslLoss = self.model.calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
-            sslLoss = sslLoss * args.ssl_reg
-
+            ceLoss= self.model.calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            # sslLoss = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
-            loss = ceLoss + regLoss + sslLoss
+            # loss = ceLoss + regLoss + sslLoss
+            loss = ceLoss + regLoss
             epLoss += loss.item()
             epPreLoss += ceLoss.item()
             # 清空优化器中的所有梯度，使得下一次反向传播时不会受到之前梯度的影响
