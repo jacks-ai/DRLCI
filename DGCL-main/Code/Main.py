@@ -85,6 +85,10 @@ class Coach:
             log('Model Initialized')
         epoch_list = []
         acc_list = []
+
+        aucMax = 0
+        bestEpoch = 0
+
         for ep in range(stloc, args.epoch):
             tstFlag = (ep % args.tstEpoch == 0)
             reses = self.trainEpoch()
@@ -94,6 +98,11 @@ class Coach:
             if tstFlag:
                 reses = self.testEpoch()
                 test_r = reses
+
+                if reses['Acc'] > aucMax:
+                    aucMax = reses['Acc']
+                    bestEpoch = ep
+
                 # 记录测试结果
                 log(self.makePrint('Test', ep, reses, tstFlag))
             logs = {'loss_all': train_loss['Loss'], 'loss_pre': train_loss['preLoss'],
@@ -110,7 +119,9 @@ class Coach:
         reses = self.testEpoch()
         log(self.makePrint('Test', args.epoch, reses, True))
         self.save_model('{}'.format(config['iteration']))
-        return reses['Acc']
+        # 每轮itration结束补充输出一个最好的结果
+        print('Best epoch : ', bestEpoch, ' , AUC : ', aucMax)
+        return reses['Acc'],aucMax
 
     # Function to prepare the model and optimizer
     def prepareModel(self):
@@ -228,11 +239,14 @@ if __name__ == '__main__':
     coach = Coach(handler)
     config = dict()
     results = list()
+    aucMax_list = list()
+
     epoch_list = []
     acc_list = []
 
     iteration_list = []
     end_acc_list = []
+    aucMax=0;
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
         seed = args.seed + i
@@ -242,20 +256,26 @@ if __name__ == '__main__':
         if args.data == 'LINCS':
             result = coach.external_test_run()
         else:
-            result = coach.run(i)  # 返回最终测试得到的reses['Acc']
+            result,aucMax = coach.run(i)  # 返回最终测试得到的reses['Acc']
         iteration_list.append(i)
         end_acc_list.append(result)
         results.append(result)
+        aucMax_list.append(aucMax)
+
     plt.plot(iteration_list, end_acc_list)
     plt.ylabel('accuracy')
     plt.xlabel('epoch')
     # plt.savefig('/home/huangpeng/DGCL-main/dgcl.png')
 
     avg_r = np.mean(np.array(results), axis=0)
+    avg_aucMax = np.mean(np.array(aucMax_list), axis=0)
     std_r = np.std(results, axis=0)  # 求标准差
     print('test results: ')
-    print(avg_r)
-    print(std_r)
+    print(results)
+    print(aucMax_list)
+    print('平均值: {}'.format(avg_r))
+    print('平均最大值: {}'.format(avg_aucMax))
+    print('方差: {}'.format(std_r))
 
     results.append(avg_r)
     results.append(std_r)

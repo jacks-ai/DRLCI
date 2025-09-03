@@ -71,6 +71,7 @@ class Model(nn.Module):
 
         # Sum all embeddings
         embeds = sum(embedsLst)
+        # 超图不仅可以做对比学习，还可以预测最终结果，都要去掉
         # return embeds, gcnEmbedsLst, hyperEmbedsLst
         return embeds
 
