@@ -246,7 +246,8 @@ if __name__ == '__main__':
 
     iteration_list = []
     end_acc_list = []
-    aucMax=0;
+    aucMax=0
+    it_max=0
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
         seed = args.seed + i
@@ -261,6 +262,9 @@ if __name__ == '__main__':
         end_acc_list.append(result)
         results.append(result)
         aucMax_list.append(aucMax)
+        if aucMax > it_max:
+            it_max = aucMax
+
 
     plt.plot(iteration_list, end_acc_list)
     plt.ylabel('accuracy')
@@ -275,6 +279,8 @@ if __name__ == '__main__':
     print(aucMax_list)
     print('平均值: {}'.format(avg_r))
     print('平均最大值: {}'.format(avg_aucMax))
+    print('iteration最大值: {}'.format(it_max))
+
     print('方差: {}'.format(std_r))
 
     results.append(avg_r)
