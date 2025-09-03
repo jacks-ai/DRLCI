@@ -58,23 +58,25 @@ class Model(nn.Module):
             # 邻接矩阵与节点嵌入作为输入
             gcnEmbeds = self.gcnLayer(self.edgeDropper(adj, keepRate), embedsLst[-1])
 
-            # Perform HGNN layer operation
-            hyperDEmbeds = self.hgnnLayer(ddHyper, embedsLst[-1][:args.drug])
-            hyperGEmbeds = self.hgnnLayer(ggHyper, embedsLst[-1][args.drug:])
-            hyperEmbeds = t.concat([hyperDEmbeds, hyperGEmbeds], axis=0)
+            # Perform HGNN layer operation  超图去掉
+            # hyperDEmbeds = self.hgnnLayer(ddHyper, embedsLst[-1][:args.drug])
+            # hyperGEmbeds = self.hgnnLayer(ggHyper, embedsLst[-1][args.drug:])
+            # hyperEmbeds = t.concat([hyperDEmbeds, hyperGEmbeds], axis=0)
 
             # Append embeddings to lists
             gcnEmbedsLst.append(gcnEmbeds)
-            hyperEmbedsLst.append(hyperEmbeds)
-            embedsLst.append(gcnEmbeds + hyperEmbeds)
+            # hyperEmbedsLst.append(hyperEmbeds)
+            # embedsLst.append(gcnEmbeds + hyperEmbeds)
+            embedsLst.append(gcnEmbeds)
 
         # Sum all embeddings
         embeds = sum(embedsLst)
-        return embeds, gcnEmbedsLst, hyperEmbedsLst
+        # return embeds, gcnEmbedsLst, hyperEmbedsLst
+        return embeds
 
     # self.model.calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds, gcnEmbedsLst, hyperEmbedsLst = self.forward(adj, keepRate)
+        embeds = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
@@ -85,20 +87,20 @@ class Model(nn.Module):
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
-        # Calculate Self-Supervised Learning (SSL) loss
+        # Calculate Self-Supervised Learning (SSL) loss 对比去掉
         sslLoss = 0
-        for i in range(1, args.gnn_layer + 1, 1):
-            # 局部嵌入不需要进行反向传播  每一层计算一次损失值
-            embeds1 = gcnEmbedsLst[i].detach()
-            embeds2 = hyperEmbedsLst[i]
-            sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
-                                    args.temp) + contrastLoss(
-                embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
-        return ceLoss, sslLoss
+        # for i in range(1, args.gnn_layer + 1, 1):
+        #     # 局部嵌入不需要进行反向传播  每一层计算一次损失值
+        #     embeds1 = gcnEmbedsLst[i].detach()
+        #     embeds2 = hyperEmbedsLst[i]
+        #     sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
+        #                             args.temp) + contrastLoss(
+        #         embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
+        return ceLoss
 
     # 预测出药物与基因关系
     def predict(self, adj, drugs, genes):
-        embeds, _, _ = self.forward(adj, 1.0)
+        embeds = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
