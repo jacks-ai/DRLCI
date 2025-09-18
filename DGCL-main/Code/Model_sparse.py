@@ -1,4 +1,5 @@
 import torch as t
+import torch_sparse
 from torch import nn
 import torch.nn.functional as F
 from Params import args
@@ -17,10 +18,11 @@ class Model(nn.Module):
         self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
 
         # Initialize GCN (Graph Convolutional Network) layer
-        self.gcnLayer = GCNLayer()
+        self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
 
-        # Initialize HGNN (Hypergraph Neural Network) layer
-        self.hgnnLayer = HGNNLayer()
+
+        # Initialize HGNN (Hypergraph Neural Network) layer 去掉
+
 
         # Initialize classifier layer
         self.classifierLayer = ClassifierLayer()
@@ -34,50 +36,37 @@ class Model(nn.Module):
         # Initialize SpAdjDropEdge layer for dropout on the graph edges
         self.edgeDropper = SpAdjDropEdge()
 
+    def forward_gcn(self, adj):
+        iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+
+        embedsLst = [iniEmbeds]
+        for gcn in self.gcnLayers:
+            embeds = gcn(adj, embedsLst[-1])
+            embedsLst.append(embeds)
+        mainEmbeds = sum(embedsLst)
+
+        return mainEmbeds[:args.drug], mainEmbeds[args.drug:]
     # forward函数最后会用于embeds，与classifierLayer组合得到最后的预测结果
+    # Perform GCN layer operation
+    # 没有显式地指定要计算哪一层 但通过 embedsLst[-1] 这个引用，隐式地保证了每一层的计算顺序和上一层的输出被正确地传递给下一层
+    # 邻接矩阵与节点嵌入作为输入
     def forward(self, adj, keepRate):
         # Concatenate drug and gene embeddings
         embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [embeds]
         gcnEmbedsLst = [embeds]
-        hyperEmbedsLst = [embeds]
-
-        # approximate the drug-hyperedge matrix and gene-hyperedge matrix
-        ddHyper = self.dEmbeds * args.mult
-        ggHyper = self.gEmbeds * args.mult
-
-        # 如果开启密集运算模式
-        if args.dense:
-            # 在超边空间的表示=嵌入矩阵*投影矩阵  @符号是矩阵乘法
-            ddHyper = self.dEmbeds @ self.dHyper
-            ggHyper = self.gEmbeds @ self.gHyper
-
-        for i in range(args.gnn_layer):
-            # Perform GCN layer operation
-            # 没有显式地指定要计算哪一层 但通过 embedsLst[-1] 这个引用，隐式地保证了每一层的计算顺序和上一层的输出被正确地传递给下一层
-            # 邻接矩阵与节点嵌入作为输入
-            gcnEmbeds = self.gcnLayer(self.edgeDropper(adj, keepRate), embedsLst[-1])
-
-            # Perform HGNN layer operation  超图去掉
-            # hyperDEmbeds = self.hgnnLayer(ddHyper, embedsLst[-1][:args.drug])
-            # hyperGEmbeds = self.hgnnLayer(ggHyper, embedsLst[-1][args.drug:])
-            # hyperEmbeds = t.concat([hyperDEmbeds, hyperGEmbeds], axis=0)
-
-            # Append embeddings to lists
-            gcnEmbedsLst.append(gcnEmbeds)
-            # hyperEmbedsLst.append(hyperEmbeds)
-            # embedsLst.append(gcnEmbeds + hyperEmbeds)
-            embedsLst.append(gcnEmbeds)
-
+        # hyperEmbedsLst = [embeds]
+        for gcn in self.gcnLayers:
+            embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            gcnEmbedsLst.append(embeds)
+            embedsLst.append(embeds)
         # Sum all embeddings
         embeds = sum(embedsLst)
-        # 超图不仅可以做对比学习，还可以预测最终结果，都要去掉
-        # return embeds, gcnEmbedsLst, hyperEmbedsLst
-        return embeds
+        return embeds, gcnEmbedsLst
 
     # self.model.calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds = self.forward(adj, keepRate)
+        embeds, gcnEmbedsLst = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
@@ -118,21 +107,12 @@ class Model(nn.Module):
 class GCNLayer(nn.Module):
     def __init__(self):
         super(GCNLayer, self).__init__()
+    def forward(self, adj, embeds, flag=True):
+        if (flag):
+            return t.spmm(adj, embeds)
+        else:
+            return torch_sparse.spmm(adj.indices(), adj.values(), adj.shape[0], adj.shape[1], embeds)
 
-    def forward(self, adj, embeds):
-        # spmm 稀疏矩阵乘法（Sparse Matrix Multiplication）
-        return l2_norm(t.spmm(adj, embeds))
-
-
-# Define the HGNN (Hypergraph Neural Network) layer
-class HGNNLayer(nn.Module):
-    def __init__(self):
-        super(HGNNLayer, self).__init__()
-
-    def forward(self, adj, embeds):
-        lat = adj.T @ embeds
-        ret = adj @ lat
-        return l2_norm(ret)
 
 # Define the SpAdjDropEdge layer for graph edge dropout
 # 使用mask来消去一部分数据
