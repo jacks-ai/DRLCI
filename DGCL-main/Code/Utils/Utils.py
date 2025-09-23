@@ -76,3 +76,9 @@ def l2_norm(x):
     # 确保输出张量维度与原始张量一致
     # This is an equivalent replacement for tf.l2_normalize, see https://www.tensorflow.org/versions/r1.15/api_docs/python/tf/math/l2_normalize for more information.
     return x / (t.max(t.norm(x, dim=1, keepdim=True), epsilon))
+
+# 向量之间点积  im=-1 表示在最后一个维度上求和  [4096, 1, 128]自动广播为[4096, 100, 128]
+# * 操作符专门用于逐元素乘法  [4096, 1, 128]*[4096, 100, 128]  不是矩阵乘法
+# usrEmbeds 的形状 [4096, 1, 128] 会被广播成 [4096, 100, 128]，然后与 itmEmbeds 进行逐元素相乘
+def innerProduct(usrEmbeds, itmEmbeds):
+	return t.sum(usrEmbeds * itmEmbeds, dim=-1)

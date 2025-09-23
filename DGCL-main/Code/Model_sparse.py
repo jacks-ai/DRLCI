@@ -1,10 +1,11 @@
 import torch as t
-import torch_sparse
 from torch import nn
 import torch.nn.functional as F
 from Params import args
-from Utils.Utils import contrastLoss, ce, l2_norm
-
+from Utils.Utils import contrastLoss, ce, l2_norm, calcRegLoss, innerProduct
+import numpy as np
+from copy import deepcopy
+import torch_sparse
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
@@ -20,22 +21,26 @@ class Model(nn.Module):
         # Initialize GCN (Graph Convolutional Network) layer
         self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
 
-
-        # Initialize HGNN (Hypergraph Neural Network) layer 去掉
-
-
         # Initialize classifier layer
         self.classifierLayer = ClassifierLayer()
 
-        # Initialize trainable parametric matrices for drug-hyperedge matrix and gene-hyperedge matrix
-        if args.dense:
-            # nn.Parameter 将张量变成模型的参数，意味着在训练过程中，dHyper 和 gHyper 的值会被优化器更新
-            self.dHyper = nn.Parameter(init(t.empty(args.latdim, args.hyperNum)))
-            self.gHyper = nn.Parameter(init(t.empty(args.latdim, args.hyperNum)))
-
-        # Initialize SpAdjDropEdge layer for dropout on the graph edges
         self.edgeDropper = SpAdjDropEdge()
 
+    def forward(self, adj, keepRate):
+        # Concatenate drug and gene embeddings
+        embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+        embedsLst = [embeds]
+        gcnEmbedsLst = [embeds]
+        # hyperEmbedsLst = [embeds]
+        for gcn in self.gcnLayers:
+            embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+
+            gcnEmbedsLst.append(embeds)
+            embedsLst.append(embeds)
+        # Sum all embeddings
+        embeds = sum(embedsLst)
+        return embeds, gcnEmbedsLst
+    #用于模型生成药物与基因嵌入
     def forward_gcn(self, adj):
         iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
@@ -46,25 +51,103 @@ class Model(nn.Module):
         mainEmbeds = sum(embedsLst)
 
         return mainEmbeds[:args.drug], mainEmbeds[args.drug:]
-    # forward函数最后会用于embeds，与classifierLayer组合得到最后的预测结果
-    # Perform GCN layer operation
-    # 没有显式地指定要计算哪一层 但通过 embedsLst[-1] 这个引用，隐式地保证了每一层的计算顺序和上一层的输出被正确地传递给下一层
-    # 邻接矩阵与节点嵌入作为输入
-    def forward(self, adj, keepRate):
-        # Concatenate drug and gene embeddings
-        embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
-        embedsLst = [embeds]
-        gcnEmbedsLst = [embeds]
-        # hyperEmbedsLst = [embeds]
-        for gcn in self.gcnLayers:
-            embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
-            gcnEmbedsLst.append(embeds)
-            embedsLst.append(embeds)
-        # Sum all embeddings
-        embeds = sum(embedsLst)
-        return embeds, gcnEmbedsLst
+    def compute_weighted_negative_scores(self, drugEmbeds, hard_negEmbeds, hard_prob):
+        """
+        计算加权的负样本分数
+        参数:
+        drugEmbeds: [batch_size, embed_dim] - 药物嵌入
+        hard_negEmbeds: [batch_size, num_hard_neg, embed_dim] - 困难负样本嵌入
+        hard_prob: [batch_size, num_hard_neg] - 困难负样本概率分布
 
-    # self.model.calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+        返回:
+        weighted_negScores: [batch_size, num_hard_neg] - 加权的负样本分数
+        aggregated_negScore: [batch_size, 1] - 聚合的负样本分数
+        """
+        # 计算原始的负样本分数
+        negScores = innerProduct(drugEmbeds.unsqueeze(1), hard_negEmbeds)  # [batch_size, num_hard_neg]
+        print(f"Raw negScores stats: min={negScores.min():.6f}, max={negScores.max():.6f}, mean={negScores.mean():.6f}")
+
+        # 对负样本分数应用指数函数增强差异
+        negScores = t.exp(negScores)  # [batch_size, num_hard_neg]
+        print(f"After exp negScores stats: min={negScores.min():.6f}, max={negScores.max():.6f}, mean={negScores.mean():.6f}")
+        
+        # 检查exp后是否有inf
+        if t.isinf(negScores).any():
+            print("WARNING: negScores contains Inf after exp!")
+            print(f"Number of Inf values: {t.isinf(negScores).sum()}")
+
+        # 将概率分布移到GPU并分离计算图
+        hard_prob = hard_prob.detach().cuda()  # [batch_size, num_hard_neg]
+        print(f"hard_prob stats: min={hard_prob.min():.6f}, max={hard_prob.max():.6f}, mean={hard_prob.mean():.6f}")
+
+        # 方法1: 直接加权 - 每个负样本分数乘以其概率权重 更丰富的梯度信息，更好的对比学习效果 torch.Size([499, 10])
+        weighted_negScores = negScores * hard_prob  # [batch_size, num_hard_neg]
+        print(f"After weighting stats: min={weighted_negScores.min():.6f}, max={weighted_negScores.max():.6f}")
+        
+        # 求和，并保持原有维度数量不变
+        weighted_negScores = weighted_negScores.sum(1, keepdim=True)
+        print(f"After sum stats: min={weighted_negScores.min():.6f}, max={weighted_negScores.max():.6f}")
+        
+        weighted_negScores=weighted_negScores * args.num_hard_neg  # [batch_size, 1]
+        print(f"Final weighted_negScores stats: min={weighted_negScores.min():.6f}, max={weighted_negScores.max():.6f}")
+        
+        # 检查最终结果
+        if t.isnan(weighted_negScores).any():
+            print("WARNING: Final weighted_negScores contains NaN!")
+        if t.isinf(weighted_negScores).any():
+            print("WARNING: Final weighted_negScores contains Inf!")
+
+        # 加权平均导致稀释，需要乘以num_hard_neg
+
+        # 方法2: 概率加权聚合 - 将所有负样本分数按概率加权求和
+        # aggregated_negScore = torch.sum(negScores * hard_prob_detached, dim=1, keepdim=True)  # [batch_size, 1]
+        print(f"Original negScores shape: {negScores.shape}")
+        print(f"Weighted negScores shape: {weighted_negScores.shape}")
+        return weighted_negScores
+
+    #困难负样本损失
+    def batch_bias_hard(self, drugEmbeds, posEmbeds,hard_negEmbeds, hard_prob):
+        posScores = innerProduct(drugEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
+        hard_negative_scores = self.compute_weighted_negative_scores(drugEmbeds, hard_negEmbeds, hard_prob) # [batch_size, 1]
+        
+        # 调试信息：检查每个步骤的值
+        print(f"posScores stats: min={posScores.min():.6f}, max={posScores.max():.6f}, mean={posScores.mean():.6f}")
+        print(f"hard_negative_scores stats: min={hard_negative_scores.min():.6f}, max={hard_negative_scores.max():.6f}, mean={hard_negative_scores.mean():.6f}")
+        
+        # 检查是否有NaN或无穷大
+        if t.isnan(posScores).any():
+            print("WARNING: posScores contains NaN!")
+        if t.isnan(hard_negative_scores).any():
+            print("WARNING: hard_negative_scores contains NaN!")
+        if t.isinf(posScores).any():
+            print("WARNING: posScores contains Inf!")
+        if t.isinf(hard_negative_scores).any():
+            print("WARNING: hard_negative_scores contains Inf!")
+        
+        # 计算分母，检查是否为0
+        denominator = posScores + hard_negative_scores
+        print(f"denominator stats: min={denominator.min():.6f}, max={denominator.max():.6f}")
+        
+        # 计算比值
+        ratio = posScores / denominator
+        print(f"ratio stats: min={ratio.min():.6f}, max={ratio.max():.6f}")
+        
+        # 检查比值是否有问题
+        if t.isnan(ratio).any():
+            print("WARNING: ratio contains NaN!")
+        if (ratio <= 0).any():
+            print("WARNING: ratio contains non-positive values!")
+            print(f"Number of non-positive ratios: {(ratio <= 0).sum()}")
+        
+        # 添加数值稳定性处理
+        ratio = t.clamp(ratio, min=1e-8, max=1.0)  # 防止log(0)和log(>1)
+        
+        loss = -1 * t.log(ratio).mean()
+        
+        print(f"Final loss: {loss.item():.6f}")
+        return loss
+
+    #计算交叉熵损失
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
         embeds, gcnEmbedsLst = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
@@ -77,20 +160,9 @@ class Model(nn.Module):
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
-        # Calculate Self-Supervised Learning (SSL) loss 对比去掉
-        sslLoss = 0
-        # for i in range(1, args.gnn_layer + 1, 1):
-        #     # 局部嵌入不需要进行反向传播  每一层计算一次损失值
-        #     embeds1 = gcnEmbedsLst[i].detach()
-        #     embeds2 = hyperEmbedsLst[i]
-        #     sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
-        #                             args.temp) + contrastLoss(
-        #         embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
         return ceLoss
-
-    # 预测出药物与基因关系
     def predict(self, adj, drugs, genes):
-        embeds = self.forward(adj, 1.0)
+        embeds, _ = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
@@ -101,9 +173,18 @@ class Model(nn.Module):
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         return pre
 
+    def getEmbeds(self):
+        self.unfreeze(self.gcnLayers)
+        return t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
-# Define the GCN (Graph Convolutional Network) layer
-# 简化版本的GCN 来捕获本地依赖关系
+    def unfreeze(self, layer):
+        for child in layer.children():
+            for param in child.parameters():
+                param.requires_grad = True
+    def getGCN(self):
+        return self.gcnLayers
+
+#Define the GCN (Graph Convolutional Network) layer
 class GCNLayer(nn.Module):
     def __init__(self):
         super(GCNLayer, self).__init__()
@@ -114,8 +195,16 @@ class GCNLayer(nn.Module):
             return torch_sparse.spmm(adj.indices(), adj.values(), adj.shape[0], adj.shape[1], embeds)
 
 
+# Define the GCN (Graph Convolutional Network) layer
+# class GCNLayer(nn.Module):
+#     def __init__(self):
+#         super(GCNLayer, self).__init__()
+#
+#     def forward(self, adj, embeds):
+#         return l2_norm(t.spmm(adj, embeds))
+
+
 # Define the SpAdjDropEdge layer for graph edge dropout
-# 使用mask来消去一部分数据
 class SpAdjDropEdge(nn.Module):
     def __init__(self):
         super(SpAdjDropEdge, self).__init__()
@@ -126,12 +215,10 @@ class SpAdjDropEdge(nn.Module):
         vals = adj._values()
         idxs = adj._indices()
         edgeNum = vals.size()
-        # floor()向下取整 结果为 0 或 1 然后将 0/1 转换为布尔掩码
-        # torch.rand() 生成的是 [0, 1) 范围内的均匀分布随机数
         mask = ((t.rand(edgeNum) + keepRate).floor()).type(t.bool)
-        newVals = vals[mask] / keepRate # 丢弃了部分元素后，剩余元素值需要进行缩放，以保持期望值不变
-        newIdxs = idxs[:, mask]  # mask 中为 True 的位置对应的 idxs 索引将被保留
-        return t.sparse.FloatTensor(newIdxs, newVals, adj.shape)
+        newVals = vals[mask] / keepRate
+        newIdxs = idxs[:, mask]
+        return t.sparse_coo_tensor(newIdxs, newVals, adj.shape)
 
 
 # Define the ClassifierLayer for classification
