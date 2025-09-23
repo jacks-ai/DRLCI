@@ -147,9 +147,6 @@ class Coach:
         # 选项1: 点积相似度（当前使用）
         similarity_scores = torch.mm(negEmbeds_flat, itmEmbeds.T)
 
-        # 应用指数函数增强相似度差异
-        # similarity_scores = torch.exp(similarity_scores)
-        
         # 重塑回原来的形状: [batch_size, num_neg, num_genes]  4096 100 1664  num_genes==1664
         # 每一个批次中，每一个负样本，与每一个正样本基因数据的相似度
         similarity_scores = similarity_scores.view(batch_size, num_neg, num_genes)
@@ -213,12 +210,6 @@ class Coach:
 
                 # 方法2: 直接对原始分数进行softmax（可选，取消注释使用）
                 # hard_prob = F.softmax(hard_neg_scores_selected, dim=1)
-
-                print(f"Hard neg scores shape: {hard_neg_scores_selected.shape}")
-                print(f"Hard prob shape: {hard_prob.shape}")
-                print(f"Hard prob sum check: {hard_prob.sum(dim=1)[:5]}")  # 检查概率和是否为1
-
-
                 # 使用高级索引选择困难负样本的嵌入
                 batch_indices = torch.arange(negEmbeds.size(0)).unsqueeze(1).expand(-1, num_hard_neg).cuda()
                 # 得到困难负样本嵌入
@@ -226,15 +217,25 @@ class Coach:
 
                 hard_loss = self.model.batch_bias_hard(drugEmbeds, posEmbeds, hard_negEmbeds, hard_prob)
                 regLoss = calcRegLoss(self.model) * args.reg
-                hard_loss_sum+=float(hard_loss.item())
-
-                loss = hard_loss+regLoss
 
                 self.opt.zero_grad()
-                loss.backward()
+                
+                # 方案1: 只对困难负样本损失进行梯度裁剪
+                hard_loss.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=args.clip_grad_norm)
+                
+                # 正则化损失正常反向传播（不裁剪）
+                regLoss.backward()
+                
+                # 方案2: 对所有损失一起裁剪（注释掉）
+                # loss = hard_loss + regLoss
+                # loss.backward()
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=args.clip_grad_norm)
+                
+                # 在梯度处理后记录损失值
+                hard_loss_sum += float(hard_loss.item())
+                
                 self.opt.step()
-
-
                 # print(f"Original negEmbeds shape: {negEmbeds.shape}")
                 # print(f"Selected hard negEmbeds shape: {hard_negEmbeds.shape}")
                 # print(f"Hard indices shape: {hard_indices_selected.shape}")
@@ -288,6 +289,8 @@ class Coach:
             self.opt.zero_grad()
             # 反向传播 沿着计算图计算出梯度
             loss.backward()
+            # 梯度裁剪，防止梯度爆炸
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=args.clip_grad_norm)
             # 使用计算得到的梯度和学习率
             # 使用优化算法（例如 SGD、Adam、RMSprop 等）来更新模型参数
             self.opt.step()

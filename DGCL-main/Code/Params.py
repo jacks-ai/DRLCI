@@ -3,7 +3,7 @@ import argparse
 
 def ParseArgs():
     parser = argparse.ArgumentParser(description='Model Params')
-    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--lr', default=5e-3, type=float, help='learning rate')
     parser.add_argument('--batch', default=4096, type=int, help='batch size')
     parser.add_argument('--tstBat', default=100000, type=int, help='number of interactions in a testing batch')
     parser.add_argument('--reg', default=1e-7, type=float, help='weight decay regularizer 权重衰减正则化')
@@ -29,7 +29,8 @@ def ParseArgs():
 	                        train/val/test and evaluate on val only;\
 	                        otherwise, use testing mode which splits all relations into train/test')
     parser.add_argument('--num_neg', type=int, default=100, help='生成全局负样本最大数量')
-    parser.add_argument('--num_hard_neg', type=int, default=10, help='选择困难负样本的数量')
+    parser.add_argument('--num_hard_neg', type=int, default=20, help='选择困难负样本的数量')
+    parser.add_argument('--clip_grad_norm', type=float, default=5.0, help='梯度裁剪的最大范数')
 
     return parser.parse_args()
 
