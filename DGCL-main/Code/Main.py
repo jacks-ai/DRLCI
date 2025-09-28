@@ -78,13 +78,21 @@ class Coach:
         print("Gene adjacency matrix built successfully!")
         
         # 设置二跳邻居缓存文件路径
-        cache_dir = r"D:\桌面\研\论文\实验代码\DGCL-main\DGCL-main\Data\cache"
+        cache_dir = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/cache"
         cache_filename = f"two_hop_{args.data}_{args.num_two_hop}.npz"
         self.two_hop_cache_path = os.path.normpath(os.path.join(cache_dir, cache_filename))
         print(f"💾 Expected cache file: {self.two_hop_cache_path}")
 
-        # 尝试加载缓存，如果找不到就报错
+        # 尝试加载缓存
         self.two_hop_cache = self.load_two_hop_cache()
+        
+        # 如果缓存为空，自动计算并保存
+        if self.two_hop_cache is None:
+            print("🚀 Cache is empty, computing all two-hop neighbors...")
+            self.two_hop_cache = self.precompute_all_two_hop_neighbors()
+            self.save_two_hop_cache(self.two_hop_cache)
+            print("✅ Two-hop neighbors computed and cached successfully!")
+        
         print("⚡ Using cached two-hop neighbors for fast training!")
 
     # Function to create a formatted print statement
@@ -253,17 +261,14 @@ class Coach:
 
     def load_two_hop_cache(self):
         """
-        加载二跳邻居缓存文件，如果找不到就报错
-        返回: 缓存字典
+        加载二跳邻居缓存文件，如果找不到或为空则返回None
+        返回: 缓存字典或None
         """
         print(f"🔍 Looking for cache file: {self.two_hop_cache_path}")
         
         if not os.path.exists(self.two_hop_cache_path):
-            raise FileNotFoundError(
-                f"❌ Two-hop neighbor cache file not found!\n"
-                f"Expected: {self.two_hop_cache_path}\n"
-                f"Please create the cache file first."
-            )
+            print("📁 Cache file not found")
+            return None
         
         try:
             print(f"🔄 Loading cache...")
@@ -271,16 +276,15 @@ class Coach:
             # 检查文件大小
             actual_size = os.path.getsize(self.two_hop_cache_path)
             if actual_size == 0:
-                raise ValueError(f"❌ Cache file is empty (0 bytes)")
+                print("📁 Cache file is empty")
+                return None
             
             cache_data = np.load(self.two_hop_cache_path, allow_pickle=True)
             
             # 验证缓存文件结构
-            if 'two_hop_neighbors' not in cache_data:
-                raise KeyError(f"❌ Cache file missing 'two_hop_neighbors' key")
-            
-            if 'params' not in cache_data:
-                raise KeyError(f"❌ Cache file missing 'params' key")
+            if 'two_hop_neighbors' not in cache_data or 'params' not in cache_data:
+                print("📁 Cache file structure invalid")
+                return None
             
             # 验证缓存参数是否匹配
             cached_params = cache_data['params'].item()
@@ -292,11 +296,10 @@ class Coach:
             }
             
             if cached_params != current_params:
-                raise ValueError(
-                    f"❌ Cache parameters mismatch!\n"
-                    f"Cached: {cached_params}\n"
-                    f"Current: {current_params}"
-                )
+                print(f"📁 Cache parameters mismatch:")
+                print(f"  Cached: {cached_params}")
+                print(f"  Current: {current_params}")
+                return None
             
             cache_dict = cache_data['two_hop_neighbors'].item()
             print(f"✅ Loaded {len(cache_dict)} cached pairs ({actual_size/(1024*1024):.2f} MB)")
@@ -304,7 +307,8 @@ class Coach:
             return cache_dict
             
         except Exception as e:
-            raise RuntimeError(f"❌ Failed to load cache file: {e}")
+            print(f"❌ Failed to load cache file: {e}")
+            return None
 
     def save_two_hop_cache(self, cache_dict):
         """
@@ -503,7 +507,7 @@ class Coach:
                 two_hop_neighbors.append(cached_neighbors)
                 cache_hits += 1
                 
-                # 根据缓存结果推断情况类型（简化统计）
+                # 根据缓存结果推断情况类型（简化统计） 现在都是从缓存中读出来的
                 self.epoch_two_hop_stats['enough_filtered'] += 1
             else:
                 # 缓存未命中，报错
