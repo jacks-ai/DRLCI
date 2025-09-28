@@ -7,6 +7,8 @@ import torch as t
 import torch.utils.data as data
 import torch.utils.data as dataloader
 from collections import Counter
+from multiprocessing import Pool, cpu_count
+import time
 
 
 
@@ -314,22 +316,108 @@ class TrnData(data.Dataset):
         self.negs =  np.zeros((len(d_train_idx), args.num_neg)).astype(np.int32)
 
     def negSampling(self):
-        for i in range(len(self.d_train_idx)):
-            u = self.d_train_idx[i]
-            count = 0
-            count_over = 0
-            while True:
-                iNeg = np.random.randint(args.gene)
-                # if (iNeg == args.gene_pad):  # 不考虑补全
-                #     continue
-                if (u, iNeg) not in self.dokmat:
-                    if(count == args.num_neg):
-                        break
-                    if(count_over == args.gene / 2):
-                        break
-                    self.negs[i][count] = iNeg
-                    count += 1
-                    count_over += 1
+        """
+        多核并行优化的负采样函数：批量采样 + 向量化过滤 + 多进程并行
+        性能提升：利用40个CPU核心并行处理
+        """
+        start_time = time.time()
+        
+        # 预计算每个drug的正样本基因集合（一次性计算）
+        if not hasattr(self, 'positive_genes_dict'):
+            print("预计算正样本基因集合...")
+            self.positive_genes_dict = {}
+            for drug in range(args.drug):
+                # 找到该drug的所有正样本基因
+                pos_genes = [gene for (d, gene) in self.dokmat.keys() if d == drug]
+                self.positive_genes_dict[drug] = set(pos_genes)
+            print(f"预计算完成，耗时: {time.time() - start_time:.2f}秒")
+        
+        # 确定使用的进程数（最多使用35个核心，留5个给系统）
+        num_processes = min(35, cpu_count())
+        print(f"使用 {num_processes} 个CPU核心进行并行负采样...")
+        
+        # 将样本分块，每块分配给一个进程
+        total_samples = len(self.d_train_idx)
+        chunk_size = max(1, total_samples // num_processes)
+        
+        # 准备并行处理的参数
+        chunks = []
+        for i in range(0, total_samples, chunk_size):
+            end_idx = min(i + chunk_size, total_samples)
+            chunk_drugs = self.d_train_idx[i:end_idx]
+            chunk_indices = list(range(i, end_idx))
+            chunks.append((chunk_drugs, chunk_indices, self.positive_genes_dict))
+        
+        # 并行处理
+        parallel_start = time.time()
+        with Pool(processes=num_processes) as pool:
+            results = pool.map(self._process_chunk, chunks)
+        
+        # 合并结果
+        for chunk_results, chunk_indices in results:
+            for idx, neg_samples in enumerate(chunk_results):
+                self.negs[chunk_indices[idx]] = neg_samples
+        
+        total_time = time.time() - start_time
+        parallel_time = time.time() - parallel_start
+        print(f"负采样完成！总耗时: {total_time:.2f}秒，并行处理: {parallel_time:.2f}秒")
+    
+    @staticmethod
+    def _process_chunk(chunk_data):
+        """
+        静态方法：处理一个数据块的负采样
+        用于多进程并行处理
+        """
+        chunk_drugs, chunk_indices, positive_genes_dict = chunk_data
+        
+        # 批量生成候选负样本的参数
+        oversample_factor = 5  # 增加过采样因子以减少补充次数
+        total_candidates = args.num_neg * oversample_factor
+        
+        chunk_results = []
+        
+        for drug in chunk_drugs:
+            pos_genes = positive_genes_dict[drug]
+            pos_genes_array = np.array(list(pos_genes))  # 转换为numpy数组提高效率
+            
+            # 批量生成候选负样本
+            candidates = np.random.randint(0, args.gene, size=total_candidates)
+            
+            # 向量化过滤：移除正样本（优化版本）
+            if len(pos_genes) > 0:
+                mask = ~np.isin(candidates, pos_genes_array)
+                valid_negatives = candidates[mask]
+            else:
+                valid_negatives = candidates
+            
+            # 如果有效负样本不够，继续生成（减少循环次数）
+            max_attempts = 3  # 最多尝试3次
+            attempt = 0
+            while len(valid_negatives) < args.num_neg and attempt < max_attempts:
+                needed = args.num_neg - len(valid_negatives)
+                additional_size = max(needed * 3, total_candidates)  # 动态调整生成数量
+                additional_candidates = np.random.randint(0, args.gene, size=additional_size)
+                
+                if len(pos_genes) > 0:
+                    additional_mask = ~np.isin(additional_candidates, pos_genes_array)
+                    additional_valid = additional_candidates[additional_mask]
+                else:
+                    additional_valid = additional_candidates
+                    
+                valid_negatives = np.concatenate([valid_negatives, additional_valid])
+                attempt += 1
+            
+            # 取前num_neg个作为最终的负样本
+            if len(valid_negatives) >= args.num_neg:
+                result = valid_negatives[:args.num_neg]
+            else:
+                # 如果还是不够，用重复采样填充（很少发生）
+                result = np.pad(valid_negatives, (0, args.num_neg - len(valid_negatives)), 
+                              mode='wrap')[:args.num_neg]
+            
+            chunk_results.append(result)
+        
+        return chunk_results, chunk_indices
 
     def __len__(self):
         return len(self.train_labels)

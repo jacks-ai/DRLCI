@@ -6,6 +6,8 @@ from Utils.Utils import contrastLoss, ce, l2_norm, calcRegLoss, innerProduct
 import numpy as np
 from copy import deepcopy
 import torch_sparse
+import time
+import os
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
@@ -53,15 +55,7 @@ class Model(nn.Module):
         return mainEmbeds[:args.drug], mainEmbeds[args.drug:]
     def compute_weighted_negative_scores(self, drugEmbeds, hard_negEmbeds, hard_prob):
         """
-        计算加权的负样本分数
-        参数:
-        drugEmbeds: [batch_size, embed_dim] - 药物嵌入
-        hard_negEmbeds: [batch_size, num_hard_neg, embed_dim] - 困难负样本嵌入
-        hard_prob: [batch_size, num_hard_neg] - 困难负样本概率分布
-
-        返回:
-        weighted_negScores: [batch_size, num_hard_neg] - 加权的负样本分数
-        aggregated_negScore: [batch_size, 1] - 聚合的负样本分数
+        计算加权的负样本分数（简化版本）
         """
         # 计算原始的负样本分数
         negScores = innerProduct(drugEmbeds.unsqueeze(1), hard_negEmbeds)  # [batch_size, num_hard_neg]
@@ -81,16 +75,22 @@ class Model(nn.Module):
         weighted_negScores = weighted_negScores.sum(1, keepdim=True)
         weighted_negScores = weighted_negScores * args.num_hard_neg  # [batch_size, 1]
 
-        # 加权平均导致稀释，需要乘以num_hard_neg
         return weighted_negScores
 
     #困难负样本损失
     def batch_bias_hard(self, drugEmbeds, posEmbeds, hard_negEmbeds, hard_prob):
-        posScores = innerProduct(drugEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
+        """
+        困难负样本损失（简化版本）
+        """
+        # 对正样本嵌入进行调整，减少0.01来驱动负样本学习
+        adjusted_posEmbeds = posEmbeds - 0.01
+        
+        posScores = innerProduct(drugEmbeds.unsqueeze(1), adjusted_posEmbeds.unsqueeze(1))  # [batch_size, 1]
         hard_negative_scores = self.compute_weighted_negative_scores(drugEmbeds, hard_negEmbeds, hard_prob) # [batch_size, 1]
-        x=(posScores / (posScores + hard_negative_scores)).mean()
-        print(x)
-        loss = -1 * t.log(x)
+        
+        x = (posScores / (posScores + hard_negative_scores)).mean()
+        loss = -t.log(x.clamp(min=1e-8))  # 只保留基本的数值稳定性
+        
         return loss
 
     #计算交叉熵损失
@@ -99,10 +99,11 @@ class Model(nn.Module):
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
-        dEmbeds = dEmbeds[drugs]
+        dEmbeds = dEmbeds[drugs]  # ([4096, 128])
         gEmbeds = gEmbeds[genes]
 
-        # Calculate Cross-Entropy loss
+
+        # Calculate Cross-Entropy loss   torch.Size([4096, 14]) 或 torch.Size([4096, 2])
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
