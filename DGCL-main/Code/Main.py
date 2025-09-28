@@ -16,6 +16,7 @@ from sklearn.metrics import accuracy_score
 import numpy as np
 import random
 from copy import deepcopy
+import time
 
 # Function to set random seed for reproducibility
 #通过设置一个固定的种子值，我们可以确保每次实验的初始化和随机过程相同，从而使得实验的结果可重复
@@ -75,6 +76,16 @@ class Coach:
         print("Building gene-gene adjacency matrix for two-hop neighbors...")
         self.build_gene_adjacency_matrix()
         print("Gene adjacency matrix built successfully!")
+        
+        # 设置二跳邻居缓存文件路径
+        cache_dir = r"D:\桌面\研\论文\实验代码\DGCL-main\DGCL-main\Data\cache"
+        cache_filename = f"two_hop_{args.data}_{args.num_two_hop}.npz"
+        self.two_hop_cache_path = os.path.normpath(os.path.join(cache_dir, cache_filename))
+        print(f"💾 Expected cache file: {self.two_hop_cache_path}")
+
+        # 尝试加载缓存，如果找不到就报错
+        self.two_hop_cache = self.load_two_hop_cache()
+        print("⚡ Using cached two-hop neighbors for fast training!")
 
     # Function to create a formatted print statement
     def makePrint(self, name, ep, reses, save):
@@ -240,6 +251,194 @@ class Coach:
         else:
             return self.model
 
+    def load_two_hop_cache(self):
+        """
+        加载二跳邻居缓存文件，如果找不到就报错
+        返回: 缓存字典
+        """
+        print(f"🔍 Looking for cache file: {self.two_hop_cache_path}")
+        
+        if not os.path.exists(self.two_hop_cache_path):
+            raise FileNotFoundError(
+                f"❌ Two-hop neighbor cache file not found!\n"
+                f"Expected: {self.two_hop_cache_path}\n"
+                f"Please create the cache file first."
+            )
+        
+        try:
+            print(f"🔄 Loading cache...")
+            
+            # 检查文件大小
+            actual_size = os.path.getsize(self.two_hop_cache_path)
+            if actual_size == 0:
+                raise ValueError(f"❌ Cache file is empty (0 bytes)")
+            
+            cache_data = np.load(self.two_hop_cache_path, allow_pickle=True)
+            
+            # 验证缓存文件结构
+            if 'two_hop_neighbors' not in cache_data:
+                raise KeyError(f"❌ Cache file missing 'two_hop_neighbors' key")
+            
+            if 'params' not in cache_data:
+                raise KeyError(f"❌ Cache file missing 'params' key")
+            
+            # 验证缓存参数是否匹配
+            cached_params = cache_data['params'].item()
+            current_params = {
+                'data': args.data,
+                'drug': args.drug,
+                'gene': args.gene,
+                'num_two_hop': args.num_two_hop
+            }
+            
+            if cached_params != current_params:
+                raise ValueError(
+                    f"❌ Cache parameters mismatch!\n"
+                    f"Cached: {cached_params}\n"
+                    f"Current: {current_params}"
+                )
+            
+            cache_dict = cache_data['two_hop_neighbors'].item()
+            print(f"✅ Loaded {len(cache_dict)} cached pairs ({actual_size/(1024*1024):.2f} MB)")
+            
+            return cache_dict
+            
+        except Exception as e:
+            raise RuntimeError(f"❌ Failed to load cache file: {e}")
+
+    def save_two_hop_cache(self, cache_dict):
+        """
+        保存二跳邻居缓存到文件（仅更新现有文件）
+        参数: cache_dict - 缓存字典
+        """
+        try:
+            print(f"💾 Updating two-hop neighbors cache...")
+            print(f"📁 Target path: {self.two_hop_cache_path}")
+            
+            # 准备保存的数据
+            save_params = {
+                'data': args.data,
+                'drug': args.drug,
+                'gene': args.gene,
+                'num_two_hop': args.num_two_hop
+            }
+            
+            # 添加元数据
+            metadata = {
+                'total_pairs': len(cache_dict),
+                'updated_time': time.time(),
+                'version': '1.0',
+                'description': f'Two-hop neighbors for {args.data} dataset'
+            }
+            
+            # 保存缓存文件（覆盖现有文件）
+            print(f"🔄 Writing cache file...")
+            np.savez_compressed(
+                self.two_hop_cache_path,
+                two_hop_neighbors=cache_dict,
+                params=save_params,
+                metadata=metadata
+            )
+            
+            # 验证文件更新
+            if os.path.exists(self.two_hop_cache_path):
+                file_size = os.path.getsize(self.two_hop_cache_path) / (1024 * 1024)
+                print(f"✅ Cache updated successfully!")
+                print(f"📊 Cache file size: {file_size:.2f} MB")
+                print(f"📈 Cached {len(cache_dict)} unique (drug, gene) pairs")
+            
+        except Exception as e:
+            print(f"❌ Failed to update cache: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def precompute_all_two_hop_neighbors(self):
+        """
+        预计算所有可能的(drug, gene)对的二跳邻居
+        """
+        print("🚀 Precomputing all two-hop neighbors...")
+        cache_dict = {}
+        total_pairs = 0
+        start_time = time.time()
+        
+        # 获取所有训练数据中的(drug, gene)对
+        train_dataset = self.handler.trnLoader.dataset
+        unique_pairs = set()
+        
+        # 收集所有唯一的(drug, gene)对
+        for idx in range(len(train_dataset)):
+            drug_idx, gene_idx, _, _ = train_dataset[idx]
+            unique_pairs.add((int(drug_idx), int(gene_idx)))
+        
+        print(f"📊 Found {len(unique_pairs)} unique (drug, gene) pairs")
+        
+        # 设置随机种子确保缓存结果一致
+        np.random.seed(42)
+        
+        # 预计算每个唯一对的二跳邻居
+        for i, (drug_idx, gene_idx) in enumerate(unique_pairs):
+            if i % 1000 == 0:
+                progress = i / len(unique_pairs) * 100
+                elapsed = time.time() - start_time
+                print(f"  Progress: {i}/{len(unique_pairs)} ({progress:.1f}%) - {elapsed:.1f}s elapsed")
+            
+            # 计算这个(drug, gene)对的二跳邻居
+            two_hop_neighbors = self._compute_single_two_hop_neighbor(
+                drug_idx, gene_idx, args.num_two_hop
+            )
+            cache_dict[(drug_idx, gene_idx)] = two_hop_neighbors
+            total_pairs += 1
+        
+        elapsed_time = time.time() - start_time
+        print(f"✅ Precomputed {total_pairs} unique (drug, gene) pairs in {elapsed_time:.2f}s")
+        return cache_dict
+
+    def _compute_single_two_hop_neighbor(self, drug_idx, gene_idx, num_neighbors):
+        """
+        计算单个(drug, gene)对的二跳邻居
+        """
+        drug_gene_matrix = self.handler.trnLoader.dataset.dokmat
+        
+        # 获取一跳邻居
+        one_hop = self.gene_neighbors.get(gene_idx, set())
+        
+        # 获取二跳邻居
+        two_hop = set()
+        for one_hop_gene in one_hop:
+            second_hop = self.gene_neighbors.get(one_hop_gene, set())
+            for two_hop_gene in second_hop:
+                if two_hop_gene != gene_idx and two_hop_gene not in one_hop:
+                    two_hop.add(two_hop_gene)
+        
+        # 过滤掉与当前药物有交互关系的基因
+        filtered_two_hop = []
+        for candidate_gene in two_hop:
+            if (drug_idx, candidate_gene) not in drug_gene_matrix:
+                filtered_two_hop.append(candidate_gene)
+        
+        # 选择二跳邻居
+        if len(filtered_two_hop) >= num_neighbors:
+            selected = np.random.choice(filtered_two_hop, size=num_neighbors, replace=False)
+        elif len(filtered_two_hop) > 0:
+            selected = np.random.choice(filtered_two_hop, size=num_neighbors, replace=True)
+        else:
+            # 随机选择与药物无交互的基因
+            all_genes = set(range(args.gene))
+            drug_connected_genes = set()
+            
+            for (drug, gene) in drug_gene_matrix.keys():
+                if drug == drug_idx:
+                    drug_connected_genes.add(gene)
+            
+            no_interaction_genes = list(all_genes - drug_connected_genes)
+            
+            if len(no_interaction_genes) >= num_neighbors:
+                selected = np.random.choice(no_interaction_genes, size=num_neighbors, replace=False)
+            else:
+                selected = np.random.choice(no_interaction_genes, size=num_neighbors, replace=True)
+        
+        return selected.tolist()
+
     def build_gene_adjacency_matrix(self):
         """
         构建基因-基因邻接矩阵
@@ -276,7 +475,7 @@ class Coach:
         
     def get_two_hop_neighbors(self, drugs_batch, genes_batch, num_neighbors=5):
         """
-        获取基因的二跳邻居，排除与药物有交互关系的基因  drugs间接相关但在数据集中没有交互信息的基因！
+        获取基因的二跳邻居，从缓存读取（必须存在缓存文件）
         
         参数:
         drugs_batch: [batch_size] - 药物索引批次
@@ -288,64 +487,32 @@ class Coach:
         """
         batch_size = len(genes_batch)
         two_hop_neighbors = []
-        drug_gene_matrix = self.handler.trnLoader.dataset.dokmat  # 获取药物-基因交互矩阵
+        
+        cache_hits = 0
+        cache_misses = 0
         
         for i, gene_idx in enumerate(genes_batch):
             gene_idx = gene_idx.item() if hasattr(gene_idx, 'item') else int(gene_idx)
             drug_idx = drugs_batch[i].item() if hasattr(drugs_batch[i], 'item') else int(drugs_batch[i])
             
-            # 获取一跳邻居
-            one_hop = self.gene_neighbors.get(gene_idx, set())
+            key = (drug_idx, gene_idx)
             
-            # 获取二跳邻居
-            two_hop = set()
-            for one_hop_gene in one_hop:
-                # 一跳邻居的邻居就是二跳邻居
-                second_hop = self.gene_neighbors.get(one_hop_gene, set())
-                for two_hop_gene in second_hop:
-                    # 排除自己和一跳邻居
-                    if two_hop_gene != gene_idx and two_hop_gene not in one_hop:
-                        two_hop.add(two_hop_gene)
-            
-            # 过滤掉与当前药物有交互关系的基因
-            filtered_two_hop = []
-            for candidate_gene in two_hop:
-                # 检查 (drug_idx, candidate_gene) 是否在 dokmat 中存在
-                if (drug_idx, candidate_gene) not in drug_gene_matrix:
-                    filtered_two_hop.append(candidate_gene)
-            
-            # 随机选择指定数量的二跳邻居（无药物交互的）并进行统计
-            if len(filtered_two_hop) >= num_neighbors:
-                # 情况1：有足够的符合条件的二跳邻居
-                selected = np.random.choice(filtered_two_hop, size=num_neighbors, replace=False)
+            if key in self.two_hop_cache:
+                # 从缓存读取
+                cached_neighbors = self.two_hop_cache[key]
+                two_hop_neighbors.append(cached_neighbors)
+                cache_hits += 1
+                
+                # 根据缓存结果推断情况类型（简化统计）
                 self.epoch_two_hop_stats['enough_filtered'] += 1
-            elif len(filtered_two_hop) > 0:
-                # 情况2：有部分符合条件的二跳邻居，需要重复采样  必须重复采样，维度保持一致
-                selected = np.random.choice(filtered_two_hop, size=num_neighbors, replace=True)
-                self.epoch_two_hop_stats['some_filtered'] += 1
             else:
-                # 如果没有符合条件的二跳邻居，随机选择与药物无交互的基因
-                all_genes = set(range(args.gene))
-                drug_connected_genes = set()
-                
-                # 找到与当前药物有交互的所有基因
-                for (drug, gene) in drug_gene_matrix.keys():
-                    if drug == drug_idx:
-                        drug_connected_genes.add(gene)
-                
-                # 找到与药物无交互的基因
-                no_interaction_genes = list(all_genes - drug_connected_genes)
-                
-                if len(no_interaction_genes) >= num_neighbors:
-                    # 情况3：没有二跳邻居，有足够的无交互基因
-                    selected = np.random.choice(no_interaction_genes, size=num_neighbors, replace=False)
-                    self.epoch_two_hop_stats['enough_random'] += 1
-                else:
-                    # 情况4：极端情况，无交互基因不够，需要重复采样
-                    selected = np.random.choice(no_interaction_genes, size=num_neighbors, replace=True)
-                    self.epoch_two_hop_stats['few_random'] += 1
-
-            two_hop_neighbors.append(selected.tolist())
+                # 缓存未命中，报错
+                cache_misses += 1
+                raise KeyError(
+                    f"❌ Cache miss for (drug={drug_idx}, gene={gene_idx})!\n"
+                    f"This key is not in the cache file.\n"
+                    f"Please regenerate the cache file with complete data."
+                )
         
         return t.tensor(two_hop_neighbors, dtype=t.long)
 
