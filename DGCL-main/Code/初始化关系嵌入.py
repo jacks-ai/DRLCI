@@ -270,35 +270,6 @@ class Coach:
             posEmbeds = itmEmbeds[genes]  # 正样本嵌入 4096 128
             negEmbeds = itmEmbeds[negs]  # 负样本嵌入 4096 100 128
 
-            # 全局负采样
-            if(args.num_neg != 0):
-                # BPR_0.706 + 0.03
-                usrEmbeds, itmEmbeds = self.model.forward_gcn(data)
-                # 获取正样本和负样本的嵌入
-                ancEmbeds = usrEmbeds[drugs]  # 用户嵌入
-                posEmbeds = itmEmbeds[genes]  # 正样本嵌入
-                negEmbeds = itmEmbeds[negs]  # 所有负样本嵌入
-
-                # 批量计算分数差异
-                # ancEmbeds: [batch_size, embed_dim]
-                # posEmbeds: [batch_size, embed_dim]
-                # negEmbeds: [batch_size, num_neg, embed_dim]
-                # 通过 unsqueeze(1) 将正样本嵌入扩展维度，使其与负样本对齐
-                posScores = innerProduct(ancEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
-                negScores = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds)  # [batch_size, num_neg]
-                # 计算分数差异
-                scoreDiff = posScores - negScores  # [batch_size, num_neg]
-                # 计算 BPR 损失
-                bprLoss += - (scoreDiff).sigmoid().log().sum() / args.batch
-                # 正则化损失
-                regLoss += calcRegLoss(self.model) * args.reg
-                loss = bprLoss + regLoss
-                bpr_loss += float(bprLoss)
-                reg_loss += float(regLoss)
-                self.opt.zero_grad()
-                loss.backward()
-                self.opt.step()
-
             # 计算交叉熵损失
             ceLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
             # sslLoss = sslLoss * args.ssl_reg

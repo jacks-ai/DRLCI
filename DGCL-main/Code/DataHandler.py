@@ -334,7 +334,6 @@ class TrnData(data.Dataset):
         
         # 确定使用的进程数（最多使用35个核心，留5个给系统）
         num_processes = min(35, cpu_count())
-        print(f"使用 {num_processes} 个CPU核心进行并行负采样...")
         
         # 将样本分块，每块分配给一个进程
         total_samples = len(self.d_train_idx)
@@ -360,7 +359,7 @@ class TrnData(data.Dataset):
         
         total_time = time.time() - start_time
         parallel_time = time.time() - parallel_start
-        print(f"负采样完成！总耗时: {total_time:.2f}秒，并行处理: {parallel_time:.2f}秒")
+        print(f"使用 {num_processes} 个CPU核心进行并行负采样,总耗时: {total_time:.2f}秒，并行处理: {parallel_time:.2f}秒")
     
     @staticmethod
     def _process_chunk(chunk_data):

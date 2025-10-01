@@ -77,6 +77,49 @@ class Model(nn.Module):
 
         return weighted_negScores
 
+    def compute_weighted_negative_scores_mixed(self, drugEmbeds, hard_negEmbeds, weights):
+        """
+        计算混合加权的负样本分数（支持一跳和二跳邻居不同权重）
+        
+        参数:
+        drugEmbeds: [batch_size, 128] - 药物嵌入
+        hard_negEmbeds: [batch_size, num_hard_neg, 128] - 困难负样本嵌入
+        weights: [batch_size, num_hard_neg] - 每个负样本的权重
+        """
+        # 计算原始的负样本分数
+        negScores = innerProduct(drugEmbeds.unsqueeze(1), hard_negEmbeds)  # [batch_size, num_hard_neg]
+
+        # 对负样本分数应用指数函数增强差异
+        negScores = t.exp(negScores)  # [batch_size, num_hard_neg]
+
+        # 将权重移到GPU并分离计算图
+        weights = weights.detach()
+        if not weights.is_cuda:
+            weights = weights.cuda()
+
+        # 应用混合权重 - 每个负样本分数乘以其对应的权重
+        weighted_negScores = negScores * weights  # [batch_size, num_hard_neg]
+        
+        # 求和，保持维度
+        weighted_negScores = weighted_negScores.sum(1, keepdim=True)  # [batch_size, 1]
+
+        return weighted_negScores
+
+    def batch_bias_hard_mixed(self, drugEmbeds, posEmbeds, hard_negEmbeds, weights):
+        """
+        混合权重的困难负样本损失（支持一跳和二跳邻居不同权重）
+        """
+        # 对正样本嵌入进行调整
+        adjusted_posEmbeds = posEmbeds - 0.01
+        
+        posScores = innerProduct(drugEmbeds.unsqueeze(1), adjusted_posEmbeds.unsqueeze(1))  # [batch_size, 1]
+        hard_negative_scores = self.compute_weighted_negative_scores_mixed(drugEmbeds, hard_negEmbeds, weights) # [batch_size, 1]
+        
+        x = (posScores / (posScores + hard_negative_scores)).mean()
+        loss = -t.log(x.clamp(min=1e-8))
+        
+        return loss
+
     #困难负样本损失
     def batch_bias_hard(self, drugEmbeds, posEmbeds, hard_negEmbeds, hard_prob):
         """
