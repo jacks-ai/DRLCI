@@ -1005,6 +1005,8 @@ class Coach:
         hard_loss_sum=0
         epLoss, epPreLoss = 0, 0
         bprLoss, bpr_loss,reg_loss ,regLoss,im_loss= 0, 0 , 0,0,0
+        hard_loss,common_loss = 0,0
+
         # 数据集长度
         len__ = trnLoader.dataset.__len__()
         steps = len__ // args.batch  # 步数=长度/批次数
@@ -1035,7 +1037,7 @@ class Coach:
                 for situation, count in batch_stats.items():
                     self.epoch_two_hop_stats[situation] += count
 
-            if current_epoch == 0:
+            if current_epoch == 0 and i==0:
                 print(f"Mixed hard negatives shape: {mixed_hard_neg_embeds.shape}")
                 print(f"Negative weights shape: {neg_weights.shape}")
                 print(f"One-hop weight multiplier: {args.one_hop_weight}")
@@ -1109,37 +1111,57 @@ class Coach:
                 scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
                 hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
 
+
+
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
                 neg_loss_value = -(scoreDiff2).sigmoid().log().sum() / args.batch
 
                 # bpr_loss_value = hard_loss_value
-                bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
-                if current_epoch == 0:
+                # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
+                if current_epoch == 0 and i==0:
                     print(f"Positive scores shape: {posScores.shape}, mean: {posScores.mean():.4f}")
                     print(f"Raw negative scores shape: {hard_negScores.shape}, mean: {negScores.mean():.4f}")
                     print(f"Weighted negative scores mean: {weighted_negScores.mean():.4f}")
                     print(f"Aggregated negative score mean: {aggregated_negScore.mean():.4f}")
                     print(f"Average weight per sample: {neg_weights.mean():.4f}")
                     print(f"Score difference mean: {scoreDiff1.mean():.4f}")
-                    print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
+                    # print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
 
-                # 正则化损失
+                # 梯度累积但分别控制 - 避免损失值差异过大的影响
                 regLoss = calcRegLoss(self.model) * args.reg
-                loss = bpr_loss_value + regLoss
-
-                # 反向传播
+                
+                # 清零梯度，准备累积
                 self.opt.zero_grad()
-                loss.backward()
+                
+                # 第一步：困难负样本损失反向传播（保留计算图）
+                hard_total_loss = hard_loss_value + regLoss * 0.5  # 分摊正则化损失
+                hard_total_loss.backward(retain_graph=True)
+                
+                # 第二步：普通负样本损失反向传播（累积梯度）
+                neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss * 0.5
+                neg_total_loss.backward()
+                
+                # 统一参数更新（基于累积的梯度）
                 self.opt.step()
+                
+                # 计算总损失用于记录
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
 
                 # 记录损失
-                bpr_loss += float(bpr_loss_value)
+                # bpr_loss += float(bpr_loss_value)
+                hard_loss += hard_loss_value
+                common_loss += neg_loss_value
                 reg_loss += float(regLoss)
 
-                # 只在第一个batch输出Total loss信息，避免过多输出
-                if i == 0:
-                    print(f"Total loss: {loss:.4f} (Weighted BPR: {bpr_loss_value:.4f} + Reg: {regLoss:.4f})")
+                # 只在第一个batch输出分离式损失信息
+                if current_epoch == 0 and i==0:
+                    print(f"🔄 Gradient Accumulation Strategy:")
+                    print(f"  Hard loss: {hard_loss_value:.4f}")
+                    print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value/hard_loss_value:.1f}x)")
+                    print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
+                    print(f"  Total loss: {total_loss:.4f}")
+                    print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 计算交叉熵损失
             ceLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
@@ -1179,7 +1201,8 @@ class Coach:
         ret = dict()
         ret['Loss'] = epLoss / steps
         ret['preLoss'] = epPreLoss / steps
-        ret['bpr_loss'] = bpr_loss / steps
+        ret['common_neg_loss'] = common_loss / steps
+        ret['hard_neg_loss'] = hard_loss / steps
         ret['regLoss'] = reg_loss / steps
         return ret
 

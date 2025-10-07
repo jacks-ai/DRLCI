@@ -175,6 +175,12 @@ class DataHandler:
         weights = {key: len(sorted_labels) - idx for idx, (key, _) in enumerate(sorted_data)}
         weighted_data = [(key, weights[key]) for key, _ in sorted_labels]
 
+        # 只在args.device不存在时设置设备
+        if not hasattr(args, 'device'):
+            use_cuda = args.gpu >= 0 and t.cuda.is_available()
+            device = 'cuda:{}'.format(args.gpu) if use_cuda else 'cpu'
+            args.device = device
+
         args.class_weights = t.tensor([ value / sum([value for _, value in weighted_data])  for key, value in weighted_data]).to(args.device)
 
         if not args.validate:
