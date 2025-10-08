@@ -79,9 +79,9 @@ class Coach:
         self.iteration_two_hop_stats = []
         
         # 新增：构建基因邻接关系用于二跳邻居查找,只需要执行一次
-        print("Building gene-gene adjacency matrix for two-hop neighbors...")
-        self.build_gene_adjacency_matrix()
-        print("Gene adjacency matrix built successfully!")
+        # print("Building gene-gene adjacency matrix for two-hop neighbors...")
+        # self.build_gene_adjacency_matrix()
+        # print("Gene adjacency matrix built successfully!")
         
         # 设置混合困难负样本缓存文件路径
         cache_dir = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/cache"
@@ -421,8 +421,8 @@ class Coach:
             drug_gene_matrix_keys = list(self.handler.trnLoader.dataset.dokmat.keys())
 
             # 准备轻量级任务参数（不包含大数据）
-            print(f"📦 Preparing optimized tasks for {total_unique_pairs} pairs...")
-            print(f"📊 Data sizes: gene_neighbors={len(self.gene_neighbors)}, drug_gene_matrix={len(drug_gene_matrix_keys)}")
+            # print(f"📦 Preparing optimized tasks for {total_unique_pairs} pairs...")
+            # print(f"📊 Data sizes: gene_neighbors={len(self.gene_neighbors)}, drug_gene_matrix={len(drug_gene_matrix_keys)}")
             
             tasks = []
             for i, (drug_idx, gene_idx) in enumerate(unique_pairs_list):
@@ -442,18 +442,19 @@ class Coach:
             with ProcessPoolExecutor(
                 max_workers=max_workers,
                 initializer=init_worker_process,
-                initargs=(self.gene_neighbors, drug_gene_matrix_keys)
+                initargs=(args.data,) # 逗号很重要
             ) as executor:
-                print("🔧 Initializing worker processes with shared data...")
+                progress_interval = min(3, total_unique_pairs // 100)  # 每1%或至少每10个报告一次
+                print(f"🔧 Initializing worker processes with shared data, 汇报频率：{progress_interval}")
                 
-                # 提交所有任务（现在只传输小数据）
-                future_to_idx = {executor.submit(compute_single_pair_optimized, task): i 
-                               for i, task in enumerate(tasks)}
+                # 使用 executor.map 提高效率，并设置合理的 chunksize
+                chunksize = min(10, total_unique_pairs // (max_workers * 4))
+                results_iterator = executor.map(compute_single_pair_optimized, tasks, chunksize=chunksize)
 
-                # 处理完成的结果
-                for future in as_completed(future_to_idx):
+                # 处理结果
+                for i, future_result in enumerate(results_iterator):
                     try:
-                        (drug_idx, gene_idx), result = future.result()
+                        (drug_idx, gene_idx), result, pid = future_result
 
                         # 统计一跳和二跳邻居数量
                         one_hop_count = sum(1 for w in result['weights'] if w == args.one_hop_weight)
@@ -470,23 +471,23 @@ class Coach:
                         total_pairs += 1
                         completed += 1
 
-                        # 进度报告（每完成100个或完成时输出）
-                        if completed - last_progress_report >= 3 or completed == total_unique_pairs:
+                        # 降低进度报告频率
+                        if completed - last_progress_report >= progress_interval or completed == total_unique_pairs:
                             progress = completed / total_unique_pairs * 100
                             elapsed = time.time() - start_time
                             if completed > 0:
                                 avg_time_per_pair = elapsed / completed
                                 eta = avg_time_per_pair * (total_unique_pairs - completed)
                                 pairs_per_sec = completed / elapsed if elapsed > 0 else 0
-                                print(f"  Progress: {completed}/{total_unique_pairs} ({progress:.1f}%) - "
+                                print(f" [PID:{pid:5d}] Progress: {completed}/{total_unique_pairs} ({progress:.1f}%) - "
                                       f"{elapsed:.1f}s elapsed, ETA: {eta:.1f}s ({pairs_per_sec:.1f} pairs/s)")
                                 last_progress_report = completed
 
                     except Exception as e:
-                        print(f"❌ Task failed: {e}")
+                        # executor.map 在遇到异常时会中断，这里我们记录原始任务信息
+                        drug_idx, gene_idx = unique_pairs_list[i]
+                        print(f"❌ Task failed for pair ({drug_idx}, {gene_idx}): {e}")
                         # 使用默认值作为fallback
-                        task_idx = future_to_idx[future]
-                        drug_idx, gene_idx = unique_pairs_list[task_idx]
                         cache_dict[(drug_idx, gene_idx)] = {
                             'negatives': list(range(args.num_two_hop)),
                             'weights': [args.two_hop_weight] * args.num_two_hop
@@ -570,13 +571,8 @@ class Coach:
         返回: (neighbors_list, weights_list, situation_type)
         """
         drug_gene_matrix = self.handler.trnLoader.dataset.dokmat
-        
-        # 根据数据集选择不同的计算策略
-        if args.data == 'DrugBank':
-            return self._compute_mixed_hard_negatives_optimized(drug_idx, gene_idx, num_neighbors, drug_gene_matrix)
-        else:
-            # DGIdb 等其他数据集使用原有稳定的算法
-            return self._compute_mixed_hard_negatives_original(drug_idx, gene_idx, num_neighbors, drug_gene_matrix)
+        # DGIdb 等其他数据集使用原有稳定的算法
+        return self._compute_mixed_hard_negatives_original(drug_idx, gene_idx, num_neighbors, drug_gene_matrix)
     
     def _compute_mixed_hard_negatives_original(self, drug_idx, gene_idx, num_neighbors, drug_gene_matrix):
         """
@@ -656,75 +652,6 @@ class Coach:
             
             selected_negatives.extend(two_hop_samples.tolist())
             weights.extend([args.two_hop_weight] * actual_two_hop)  # 二跳邻居使用设定的权重倍数
-        
-        return selected_negatives, weights, situation_type
-    
-    def _compute_mixed_hard_negatives_optimized(self, drug_idx, gene_idx, num_neighbors, drug_gene_matrix):
-        """
-        优化版本的混合困难负样本计算（专门针对DrugBank大数据集）
-        """
-        # 预先获取该药物的所有交互基因（优化查询性能）
-        drug_connected_genes = set()
-        for (drug, gene) in drug_gene_matrix.keys():
-            if drug == drug_idx:
-                drug_connected_genes.add(gene)
-        
-        # 获取一跳邻居并直接过滤
-        one_hop = self.gene_neighbors.get(gene_idx, set())
-        filtered_one_hop = [g for g in one_hop if g not in drug_connected_genes]
-        
-        # 优化二跳邻居计算 - 使用集合操作避免重复遍历
-        two_hop = set()
-        for one_hop_gene in one_hop:
-            second_hop = self.gene_neighbors.get(one_hop_gene, set())
-            # 直接过滤掉不符合条件的基因，避免后续重复检查
-            valid_two_hop = second_hop - {gene_idx} - one_hop - drug_connected_genes
-            two_hop.update(valid_two_hop)
-        
-        filtered_two_hop = list(two_hop)
-        
-        # 计算一跳邻居的最大允许数量
-        max_one_hop = int(num_neighbors * args.one_hop_max_ratio)
-        actual_one_hop = min(len(filtered_one_hop), max_one_hop)
-        actual_two_hop = num_neighbors - actual_one_hop
-        
-        selected_negatives = []
-        weights = []
-        
-        # 采样一跳邻居
-        if actual_one_hop > 0 and len(filtered_one_hop) > 0:
-            if len(filtered_one_hop) >= actual_one_hop:
-                one_hop_samples = np.random.choice(filtered_one_hop, size=actual_one_hop, replace=False)
-            else:
-                one_hop_samples = np.random.choice(filtered_one_hop, size=actual_one_hop, replace=True)
-            
-            selected_negatives.extend(one_hop_samples.tolist())
-            weights.extend([args.one_hop_weight] * actual_one_hop)
-            situation_type = 'mixed_with_one_hop'
-        else:
-            situation_type = 'no_one_hop_available'
-        
-        # 采样二跳邻居填充剩余位置
-        if actual_two_hop > 0:
-            if len(filtered_two_hop) >= actual_two_hop:
-                two_hop_samples = np.random.choice(filtered_two_hop, size=actual_two_hop, replace=False)
-            elif len(filtered_two_hop) > 0:
-                two_hop_samples = np.random.choice(filtered_two_hop, size=actual_two_hop, replace=True)
-                situation_type = 'mixed_with_repeated_two_hop'
-            else:
-                # 使用预计算的无交互基因（避免重复计算）
-                all_genes = set(range(args.gene))
-                no_interaction_genes = list(all_genes - drug_connected_genes)
-                
-                if len(no_interaction_genes) >= actual_two_hop:
-                    two_hop_samples = np.random.choice(no_interaction_genes, size=actual_two_hop, replace=False)
-                    situation_type = 'mixed_with_random'
-                else:
-                    two_hop_samples = np.random.choice(no_interaction_genes, size=actual_two_hop, replace=True)
-                    situation_type = 'mixed_few_random'
-            
-            selected_negatives.extend(two_hop_samples.tolist())
-            weights.extend([args.two_hop_weight] * actual_two_hop)
         
         return selected_negatives, weights, situation_type
 
@@ -1054,42 +981,6 @@ class Coach:
                 print(f"Batch weight distribution: {one_hop_samples} one-hop ({actual_one_hop_ratio:.1%}), {two_hop_samples} two-hop ({actual_two_hop_ratio:.1%})")
 
             negEmbeds = itmEmbeds[negs]  # 负样本嵌入 4096 100 128
-            # HaSa损失 - 筛选困难负样本 暂时不用
-            # if (args.num_hard_neg > 0):
-            #     hard_neg_indices, hard_neg_scores = self.sort_hard_embedding(usrEmbeds, two_hop_neighbor_embeds)
-            #
-            #     # 筛选出前num_hard_neg个最困难的负样本 使用预定义的超参数
-            #     num_hard_neg = min(args.num_two_hop, args.num_neg)  # 不超过总负样本数
-            #     # print(f"Selecting top {num_hard_neg} hard negatives from {args.num_neg} negatives")
-            #
-            #     # 获取困难负样本的索引 [batch_size, num_hard_neg]
-            #     hard_indices_selected = hard_neg_indices[:, :num_hard_neg]
-            #
-            #     # 获取对应的困难负样本分数 [batch_size, num_hard_neg]
-            #     hard_neg_scores_selected = hard_neg_scores[:, :num_hard_neg]
-            #
-            #     # 对困难负样本分数进行归一化和softmax处理
-            #     # 方法1: 先L2归一化再softmax
-            #     hard_scores_normalized = F.normalize(hard_neg_scores_selected, p=2, dim=1)  # L2归一化
-            #     hard_prob = F.softmax(hard_scores_normalized, dim=1)  # softmax得到概率分布
-            #
-            #     # 方法2: 直接对原始分数进行softmax（可选，取消注释使用）
-            #     # hard_prob = F.softmax(hard_neg_scores_selected, dim=1)
-            #     # 使用高级索引选择困难负样本的嵌入
-            #     # 直接在GPU上创建batch_indices，避免CPU->GPU传输
-            #     batch_indices = t.arange(two_hop_neighbor_embeds.size(0), device=two_hop_neighbor_embeds.device).unsqueeze(1).expand(-1, num_hard_neg)
-            #     # 得到困难负样本嵌入
-            #     two_hop_neighbor_embeds = two_hop_neighbor_embeds[batch_indices, hard_indices_selected]  # [batch_size, num_hard_neg, 128]
-            #
-            #     hard_loss = self.get_model().batch_bias_hard(drugEmbeds, posEmbeds, two_hop_neighbor_embeds, hard_prob)
-            #
-            #     regLoss = calcRegLoss(self.model) * args.reg
-            #     self.opt.zero_grad()
-            #     loss = hard_loss + regLoss
-            #
-            #     loss.backward()
-            #     hard_loss_sum += hard_loss.detach().item()
-            #     self.opt.step()
 
             # 基于混合困难负样本的加权负采样损失
             if hasattr(args, 'num_two_hop') and args.num_two_hop > 0:
@@ -1110,8 +1001,6 @@ class Coach:
                 # 计算加权BPR损失
                 scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
                 hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
-
-
 
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
@@ -1134,19 +1023,36 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 
-                # 第一步：困难负样本损失反向传播（保留计算图）
-                hard_total_loss = hard_loss_value + regLoss * 0.5  # 分摊正则化损失
-                hard_total_loss.backward(retain_graph=True)
-                
-                # 第二步：普通负样本损失反向传播（累积梯度）
-                neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss * 0.5
-                neg_total_loss.backward()
+                # 课程学习策略：前10个epoch只用普通负样本，之后再加入困难负样本
+                if current_epoch < 0:
+                    # 前10个epoch：只使用普通负样本损失
+                    neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss
+                    # neg_total_loss.backward()
+                    
+                    # 计算总损失用于记录（不包含困难负样本）
+                    total_loss = neg_loss_value * args.common_neg_weight + regLoss
+                    
+                    if current_epoch == 0 and i == 0:
+                        print(f"🎓 Curriculum Learning: Epoch {current_epoch} - Using only common negatives")
+                else:
+                    # 第10个epoch之后：同时使用困难负样本和普通负样本
+                    # 第一步：困难负样本损失反向传播（保留计算图）
+                    hard_total_loss = hard_loss_value + regLoss * 0.5  # 分摊正则化损失
+                    # hard_total_loss.backward(retain_graph=True)
+                    
+                    # 第二步：普通负样本损失反向传播（累积梯度）
+                    neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss * 0.5
+                    # neg_total_loss.backward()
+                    
+                    # 计算总损失用于记录
+                    total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                    
+                    if current_epoch == 10 and i == 0:
+                        print(f"🎓 Curriculum Learning: Epoch {current_epoch} - Now including hard negatives!")
                 
                 # 统一参数更新（基于累积的梯度）
+                total_loss.backward()
                 self.opt.step()
-                
-                # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
 
                 # 记录损失
                 # bpr_loss += float(bpr_loss_value)
@@ -1155,10 +1061,10 @@ class Coach:
                 reg_loss += float(regLoss)
 
                 # 只在第一个batch输出分离式损失信息
-                if current_epoch == 0 and i==0:
+                if i == 0 and (current_epoch == 0):
                     print(f"🔄 Gradient Accumulation Strategy:")
                     print(f"  Hard loss: {hard_loss_value:.4f}")
-                    print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value/hard_loss_value:.1f}x)")
+                    print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value / hard_loss_value:.1f}x)")
                     print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
                     print(f"  Total loss: {total_loss:.4f}")
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
