@@ -22,7 +22,7 @@ def ParseArgs():
     parser.add_argument('--multi_gpu', action='store_true', default=False, help='use dual GPUs for parallel computation')
     parser.add_argument('--gpu_list', type=str, default='0,1', help='list of GPUs to use, separated by comma')
     parser.add_argument('--seed', default=43, type=int, help='seed')
-    parser.add_argument('--iteration', type=int, default='5', help='iteration')
+    parser.add_argument('--iteration', type=int, default='3', help='iteration')
     parser.add_argument('--is_debug', type=bool, default=False, help='is_debug')
     parser.add_argument('--dense', action='store_true', default=False, help='dense')
     parser.add_argument('--validate', action='store_true', default=False,
@@ -30,11 +30,11 @@ def ParseArgs():
 	                        train/val/test and evaluate on val only;\
 	                        otherwise, use testing mode which splits all relations into train/test')
     parser.add_argument('--num_neg', type=int, default=70, help='生成全局负样本最大数量')
-    parser.add_argument('--num_hard_neg', type=int, default=20, help='选择困难负样本的数量')
+    # parser.add_argument('--num_hard_neg', type=int, default=20, help='选择困难负样本的数量')
     parser.add_argument('--num_two_hop', type=int, default=30, help='每个基因选择的二跳邻居数量')
     parser.add_argument('--one_hop_max_ratio', type=float, default=0.1, help='一跳邻居在困难负样本中的最大比例')
 
-    parser.add_argument('--one_hop_weight', type=float, default=1.5, help='一跳困难负样本权重倍数')
+    parser.add_argument('--one_hop_weight', type=float, default=1.8, help='一跳困难负样本权重倍数')
     parser.add_argument('--two_hop_weight', type=float, default=1, help='二跳困难负样本权重倍数')
     parser.add_argument('--common_neg_weight', type=float, default=0.4, help='二跳困难负样本权重倍数')
 

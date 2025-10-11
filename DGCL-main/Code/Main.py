@@ -9,7 +9,7 @@ from Model_sparse import Model
 from DataHandler import DataHandler
 from Utils.Utils import *
 from multiprocess_helper_optimized import init_worker_process, compute_single_pair_optimized
-
+from preprocess_drug_gene_dict import load_drug_gene_dict
 
 import os
 import torch.nn.functional as F
@@ -85,9 +85,13 @@ class Coach:
         
         # 设置混合困难负样本缓存文件路径
         cache_dir = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/cache"
-        cache_filename = f"{args.data}_{args.num_two_hop}_w1h{args.one_hop_weight}_w2h{args.two_hop_weight}_r{int(args.one_hop_max_ratio*100)}_mixed_hard_neg.npz"
+        if args.data == 'DrugBank':
+            # DrugBank使用不含权重信息的文件名
+            cache_filename = f"{args.data}_NoWeight_{args.num_two_hop}_r{int(args.one_hop_max_ratio*100)}_mixed_hard_neg.npz"
+        else:
+            # 其他数据集（如DGIdb）保持原有文件名格式
+            cache_filename = f"{args.data}_{args.num_two_hop}_w1h{args.one_hop_weight}_w2h{args.two_hop_weight}_r{int(args.one_hop_max_ratio*100)}_mixed_hard_neg.npz"
         self.two_hop_cache_path = os.path.normpath(os.path.join(cache_dir, cache_filename))
-        print(f"💾 Expected mixed hard negatives cache: {self.two_hop_cache_path}")
 
         # 尝试加载缓存
         self.two_hop_cache = self.load_two_hop_cache()
@@ -294,15 +298,26 @@ class Coach:
             
             # 验证缓存参数是否匹配
             cached_params = cache_data['params'].item()
-            current_params = {
-                'data': args.data,
-                'drug': args.drug,
-                'gene': args.gene,
-                'num_two_hop': args.num_two_hop,
-                'one_hop_weight': args.one_hop_weight,
-                'two_hop_weight': args.two_hop_weight,
-                'one_hop_max_ratio': args.one_hop_max_ratio
-            }
+            if args.data == 'DrugBank':
+                # DrugBank只验证与权重无关的参数
+                current_params = {
+                    'data': args.data,
+                    'drug': args.drug,
+                    'gene': args.gene,
+                    'num_two_hop': args.num_two_hop,
+                    'one_hop_max_ratio': args.one_hop_max_ratio
+                }
+            else:
+                # 其他数据集验证所有参数，包括权重
+                current_params = {
+                    'data': args.data,
+                    'drug': args.drug,
+                    'gene': args.gene,
+                    'num_two_hop': args.num_two_hop,
+                    'one_hop_weight': args.one_hop_weight,
+                    'two_hop_weight': args.two_hop_weight,
+                    'one_hop_max_ratio': args.one_hop_max_ratio
+                }
             
             if cached_params != current_params:
                 print(f"📁 Cache parameters mismatch:")
@@ -329,15 +344,26 @@ class Coach:
             print(f"📁 Target path: {self.two_hop_cache_path}")
             
             # 准备保存的数据
-            save_params = {
-                'data': args.data,
-                'drug': args.drug,
-                'gene': args.gene,
-                'num_two_hop': args.num_two_hop,
-                'one_hop_weight': args.one_hop_weight,
-                'two_hop_weight': args.two_hop_weight,
-                'one_hop_max_ratio': args.one_hop_max_ratio
-            }
+            if args.data == 'DrugBank':
+                # DrugBank只保存与权重无关的参数
+                save_params = {
+                    'data': args.data,
+                    'drug': args.drug,
+                    'gene': args.gene,
+                    'num_two_hop': args.num_two_hop,
+                    'one_hop_max_ratio': args.one_hop_max_ratio
+                }
+            else:
+                # 其他数据集保存所有参数
+                save_params = {
+                    'data': args.data,
+                    'drug': args.drug,
+                    'gene': args.gene,
+                    'num_two_hop': args.num_two_hop,
+                    'one_hop_weight': args.one_hop_weight,
+                    'two_hop_weight': args.two_hop_weight,
+                    'one_hop_max_ratio': args.one_hop_max_ratio
+                }
             
             # 添加元数据
             metadata = {
@@ -414,7 +440,7 @@ class Coach:
             # 减少进程数，避免过多的进程创建开销
             cpu_count = multiprocessing.cpu_count()
             # max_workers = min(max(1, int(cpu_count * 0.5)), 24)  # 使用50%的CPU，最多16进程
-            max_workers=24
+            max_workers=32
             print(f"💻 Using {max_workers} processes (CPU cores: {cpu_count})")
 
             # 准备共享数据（只传输一次）
@@ -426,10 +452,9 @@ class Coach:
             
             tasks = []
             for i, (drug_idx, gene_idx) in enumerate(unique_pairs_list):
-                task_args = (
+                task_args = ( # 每个任务使用不同的随机种子（移除大数据传输）
                     drug_idx, gene_idx, args.num_two_hop,
-                    args.one_hop_weight, args.two_hop_weight, args.one_hop_max_ratio,
-                    args.gene, 42 + i  # 每个任务使用不同的随机种子（移除大数据传输）
+                    args.one_hop_max_ratio,args.gene, 42 + i
                 )
                 tasks.append(task_args)
 
@@ -444,11 +469,12 @@ class Coach:
                 initializer=init_worker_process,
                 initargs=(args.data,) # 逗号很重要
             ) as executor:
-                progress_interval = min(3, total_unique_pairs // 100)  # 每1%或至少每10个报告一次
+                progress_interval = max(100, total_unique_pairs // 200)  # 每1%或至少每10个报告一次
                 print(f"🔧 Initializing worker processes with shared data, 汇报频率：{progress_interval}")
                 
-                # 使用 executor.map 提高效率，并设置合理的 chunksize
-                chunksize = min(10, total_unique_pairs // (max_workers * 4))
+                # 使用 executor.map 提高效率，并设置合理的 chunksize 481
+                workers_ = total_unique_pairs // (max_workers * 4)
+                chunksize = min(100, workers_)
                 results_iterator = executor.map(compute_single_pair_optimized, tasks, chunksize=chunksize)
 
                 # 处理结果
@@ -456,16 +482,16 @@ class Coach:
                     try:
                         (drug_idx, gene_idx), result, pid = future_result
 
-                        # 统计一跳和二跳邻居数量
-                        one_hop_count = sum(1 for w in result['weights'] if w == args.one_hop_weight)
-                        two_hop_count = sum(1 for w in result['weights'] if w == args.two_hop_weight)
+                        # 统计一跳和二跳邻居数量 (DrugBank)
+                        one_hop_count = result['one_hop_count']
+                        two_hop_count = len(result['negatives']) - one_hop_count
                         one_hop_count_sum += one_hop_count
                         two_hop_count_sum += two_hop_count
 
-                        # 保存到缓存
+                        # 保存到缓存 (DrugBank)
                         cache_dict[(drug_idx, gene_idx)] = {
                             'negatives': result['negatives'],
-                            'weights': result['weights']
+                            'one_hop_count': one_hop_count
                         }
                         situation_stats[result['situation_type']] += 1
                         total_pairs += 1
@@ -487,10 +513,10 @@ class Coach:
                         # executor.map 在遇到异常时会中断，这里我们记录原始任务信息
                         drug_idx, gene_idx = unique_pairs_list[i]
                         print(f"❌ Task failed for pair ({drug_idx}, {gene_idx}): {e}")
-                        # 使用默认值作为fallback
+                        # 使用默认值作为fallback (DrugBank)
                         cache_dict[(drug_idx, gene_idx)] = {
                             'negatives': list(range(args.num_two_hop)),
-                            'weights': [args.two_hop_weight] * args.num_two_hop
+                            'one_hop_count': 0
                         }
                         situation_stats['mixed_few_random'] += 1
                         total_pairs += 1
@@ -725,18 +751,32 @@ class Coach:
                 cached_data = self.two_hop_cache[key]
                 
                 # 检查是否为新的混合格式
-                if isinstance(cached_data, dict) and 'negatives' in cached_data and 'weights' in cached_data:
-                    # 新格式：包含权重信息
+                if isinstance(cached_data, dict) and 'negatives' in cached_data:
                     cached_negatives = cached_data['negatives']
-                    cached_weights = cached_data['weights']
+                    
+                    if 'one_hop_count' in cached_data:
+                        # DrugBank的新格式：动态重建权重
+                        one_hop_count = cached_data['one_hop_count']
+                        num_negatives = len(cached_negatives)
+                        reconstructed_weights = ([args.one_hop_weight] * one_hop_count) + \
+                                                ([args.two_hop_weight] * (num_negatives - one_hop_count))
+                        weights.append(reconstructed_weights)
+                    elif 'weights' in cached_data:
+                        # DGIdb的格式：直接使用权重
+                        weights.append(cached_data['weights'])
+                    else:
+                        # 兼容更旧的格式
+                        weights.append([args.two_hop_weight] * len(cached_negatives))
+                    
+                    hard_negatives.append(cached_negatives)
                 else:
-                    # 旧格式：只有邻居列表，设置默认权重
+                    # 旧格式兼容：只有邻居列表，设置默认权重
                     cached_negatives = cached_data
-                    cached_weights = [args.two_hop_weight] * len(cached_negatives)  # 默认使用二跳权重
+                    reconstructed_weights = [args.two_hop_weight] * len(cached_negatives)
                     print("⚠️  Using legacy cache format without weight information")
+                    hard_negatives.append(cached_negatives)
+                    weights.append(reconstructed_weights)
                 
-                hard_negatives.append(cached_negatives)
-                weights.append(cached_weights)
                 cache_hits += 1
             else:
                 # 缓存未命中，报错
@@ -984,7 +1024,7 @@ class Coach:
 
             # 基于混合困难负样本的加权负采样损失
             if hasattr(args, 'num_two_hop') and args.num_two_hop > 0:
-                if current_epoch == 0:
+                if current_epoch == 0 and i==0:
                     print("Computing weighted BPR loss with mixed hard negatives...")
                 # 计算正样本分数
                 posScores = innerProduct(drugEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
@@ -1215,6 +1255,8 @@ if __name__ == '__main__':
     log('Start')
     handler = DataHandler()
     handler.LoadData()
+    drug_gene_dict, _ = load_drug_gene_dict(args.data)
+    handler.trnLoader.dataset.positive_genes_dict = drug_gene_dict
     log('Load Data')
 
     coach = Coach(handler)

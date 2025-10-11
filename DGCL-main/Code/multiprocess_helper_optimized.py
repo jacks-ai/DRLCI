@@ -127,7 +127,7 @@ def compute_single_pair_optimized(task_args):
     极致优化版本的单对计算函数
     使用预缓存的药物-基因字典实现O(1)查询
     """
-    drug_idx, gene_idx, num_neighbors, one_hop_weight, two_hop_weight, one_hop_max_ratio, gene_count, random_seed = task_args
+    drug_idx, gene_idx, num_neighbors, one_hop_max_ratio, gene_count, random_seed = task_args
     
     # 设置随机种子
     np.random.seed(random_seed)
@@ -153,23 +153,37 @@ def compute_single_pair_optimized(task_args):
     one_hop = _gene_neighbors.get(gene_idx, set())
     filtered_one_hop = [g for g in one_hop if g not in drug_connected_genes]
     
-    # 优化二跳邻居计算
-    two_hop = set()
-    for one_hop_gene in one_hop:
-        second_hop = _gene_neighbors.get(one_hop_gene, set())
-        valid_two_hop = second_hop - {gene_idx} - one_hop - drug_connected_genes
-        two_hop.update(valid_two_hop)
-    
-    filtered_two_hop = list(two_hop)
-    
-    # 计算采样数量
+    # 提前计算采样数量
     max_one_hop = int(num_neighbors * one_hop_max_ratio)
     actual_one_hop = min(len(filtered_one_hop), max_one_hop)
     actual_two_hop = num_neighbors - actual_one_hop
     
-    selected_negatives = []
-    weights = []
+    # 优化二跳邻居计算：当找到足够多的候选邻居时就停止
+    filtered_two_hop = []
+    if actual_two_hop > 0:
+        two_hop_candidates = set()
+        
+        # 为了避免因集合迭代顺序产生的偏见，将一跳邻居随机打乱
+        one_hop_list = list(one_hop)
+        np.random.shuffle(one_hop_list)
+        
+        # 设定一个候选池大小，避免在二跳邻居过多的情况下全部遍历
+        # 这是对采样随机性和计算效率的权衡
+        candidate_pool_size = actual_two_hop * 5
+
+        for one_hop_gene in one_hop_list:
+            # 提前检查是否已找到足够候选，避免不必要的邻居查询
+            if len(two_hop_candidates) >= candidate_pool_size:
+                break
+            
+            second_hop = _gene_neighbors.get(one_hop_gene, set())
+            valid_two_hop = second_hop - {gene_idx} - one_hop - drug_connected_genes
+            two_hop_candidates.update(valid_two_hop)
+        
+        filtered_two_hop = list(two_hop_candidates)
     
+    selected_negatives = []
+
     # 采样一跳邻居
     if actual_one_hop > 0 and len(filtered_one_hop) > 0:
         if len(filtered_one_hop) >= actual_one_hop:
@@ -178,7 +192,6 @@ def compute_single_pair_optimized(task_args):
             one_hop_samples = np.random.choice(filtered_one_hop, size=actual_one_hop, replace=True)
         
         selected_negatives.extend(one_hop_samples.tolist())
-        weights.extend([one_hop_weight] * actual_one_hop)
         situation_type = 'mixed_with_one_hop'
     else:
         situation_type = 'no_one_hop_available'
@@ -201,13 +214,12 @@ def compute_single_pair_optimized(task_args):
             else:
                 two_hop_samples = np.random.choice(no_interaction_genes, size=actual_two_hop, replace=True)
                 situation_type = 'mixed_few_random'
-        
+        # .extend() two_hop_samples所有元素“打散”后逐个加入
         selected_negatives.extend(two_hop_samples.tolist())
-        weights.extend([two_hop_weight] * actual_two_hop)
     
     return (drug_idx, gene_idx), {
         'negatives': selected_negatives,
-        'weights': weights,
+        'one_hop_count': actual_one_hop,
         'situation_type': situation_type
     }, os.getpid()
 

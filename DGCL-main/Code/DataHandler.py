@@ -321,22 +321,17 @@ class TrnData(data.Dataset):
         self.dokmat_label = coomat_label  # 带标签的稀疏矩阵
         self.negs =  np.zeros((len(d_train_idx), args.num_neg)).astype(np.int32)
 
-    def negSampling(self):
+    def negSampling(self, positive_genes_dict=None):
         """
         多核并行优化的负采样函数：批量采样 + 向量化过滤 + 多进程并行
         性能提升：利用40个CPU核心并行处理
         """
         start_time = time.time()
-        
-        # 预计算每个drug的正样本基因集合（一次性计算）
-        if not hasattr(self, 'positive_genes_dict'):
-            print("预计算正样本基因集合...")
-            self.positive_genes_dict = {}
-            for drug in range(args.drug):
-                # 找到该drug的所有正样本基因
-                pos_genes = [gene for (d, gene) in self.dokmat.keys() if d == drug]
-                self.positive_genes_dict[drug] = set(pos_genes)
-            print(f"预计算完成，耗时: {time.time() - start_time:.2f}秒")
+        # 属性根本没有注入或为空
+        if not hasattr(self, 'positive_genes_dict') or self.positive_genes_dict is None:
+            raise RuntimeError(
+                "positive_genes_dict 未设置。请先读取缓存并注入"
+            )
         
         # 确定使用的进程数（最多使用35个核心，留5个给系统）
         num_processes = min(35, cpu_count())
