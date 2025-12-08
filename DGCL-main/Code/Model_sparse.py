@@ -6,9 +6,10 @@ from Utils.Utils import contrastLoss, ce, l2_norm, calcRegLoss, innerProduct
 import numpy as np
 from copy import deepcopy
 import torch_sparse
-from torch.nn.parameter import Parameter
 import time
 import os
+from torch.nn.parameter import Parameter
+
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
@@ -40,6 +41,7 @@ class Causal_GraphConvolution(nn.Module):
     def reset_parameters(self):
         """初始化权重参数"""
         t.nn.init.xavier_uniform_(self.weight)
+        t.nn.init.xavier_uniform_(self.a)
 
     def causality_message(self):
         """
@@ -111,11 +113,7 @@ class Causal_GraphConvolution(nn.Module):
             # 基于注意力权重聚合邻居信息 这里就是计算出来的P
             h_prime = t.matmul(attention, Wh)
             Whs.append(h_prime)
-        # 输出 Whs 列表的最终长度和相关信息
-        # print(f"[Causal_GraphConvolution] Whs final length: {len(Whs)}")
-        # print(f"[Causal_GraphConvolution] Input shape: {input.shape}, batch size (dim=0): {input.shape[0]}")
-        # if len(Whs) > 0:
-        #     print(f"[Causal_GraphConvolution] First h_prime shape: {Whs[0].shape}")
+
         # 堆叠所有处理后的样本
         support = t.stack(Whs, dim=0)
 
@@ -167,22 +165,21 @@ class SELayer(nn.Module):
         y = self.fc(x).view(b, c)
         return x * y.expand_as(x)
 
-
-
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
 
-        # Initialize drug and gene embeddings
+        # 初始化药物和基因的嵌入向量
         self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))
         self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
 
-        # Initialize GCN (Graph Convolutional Network) layer
-        self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
+        # 初始化普通图卷积层
+        self.gcnLayer = GCNLayer()
 
-        # Initialize classifier layer
+        # 初始化分类层
         self.classifierLayer = ClassifierLayer()
 
+        # 初始化边dropout层，用于图结构的正则化
         self.edgeDropper = SpAdjDropEdge()
 
         # 初始化SE注意力层，用于特征重标定
@@ -193,14 +190,10 @@ class Model(nn.Module):
         self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
 
     def forward(self, adj, keepRate):
-        if adj.is_sparse:
-            adj_dropped = adj.to_dense()  # Convert sparse matrix to dense
         embeds = t.cat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [embeds]
         gcnEmbedsLst = [embeds]
         causalEmbedsLst = [embeds]
-        embeds_3d = t.unsqueeze(embeds, 0)  # 在0维位置增加一个维度
-        input = embeds_3d
 
         # 因果干预在这里实现
         for i in range(args.gnn_layer):
@@ -216,6 +209,8 @@ class Model(nn.Module):
             ae = t.add(adjusted_embeds, adjusted_embeds1)
 
             # 3. 因果感知的图卷积传递
+            # 为因果图卷积准备3D输入 [batch_size=1, num_nodes, latdim]
+            embeds_3d = t.unsqueeze(embedsLst[-1], 0)
             gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj)  # 使用因果图卷积层处理
             gcnEmbeds_c = gcnEmbeds_c.squeeze(0)  # 压缩维度
             causalEmbedsLst.append(gcnEmbeds_c)
@@ -230,20 +225,20 @@ class Model(nn.Module):
 
         # 6. 聚合所有层的特征
         embeds = sum(embedsLst)
-        return embeds, gcnEmbedsLst, causalEmbedsLst
-    # embeds中可以得到药物基因嵌入，gcnEmbedsLst目前没咋用（他俩区别就是是否有做一个sum操作）
-    # 用于模型生成药物与基因嵌入  在 trainEpoch 中使用 无（无 dropout）
+        return embeds
+
+    # 用于模型生成药物与基因嵌入
     def forward_gcn(self, adj):
         iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
         embedsLst = [iniEmbeds]
-        for gcn in self.gcnLayers:
-            # embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
-            embeds = gcn(adj, embedsLst[-1])
+        for i in range(args.gnn_layer):
+            embeds = self.gcnLayer(adj, embedsLst[-1])
             embedsLst.append(embeds)
         mainEmbeds = sum(embedsLst)
 
         return mainEmbeds[:args.drug], mainEmbeds[args.drug:]
+
     def compute_weighted_negative_scores(self, drugEmbeds, hard_negEmbeds, hard_prob):
         """
         计算加权的负样本分数（简化版本）
@@ -261,7 +256,7 @@ class Model(nn.Module):
 
         # 直接加权 - 每个负样本分数乘以其概率权重
         weighted_negScores = negScores * hard_prob  # [batch_size, num_hard_neg]
-        
+
         # 求和，并保持原有维度数量不变
         weighted_negScores = weighted_negScores.sum(1, keepdim=True)
         weighted_negScores = weighted_negScores * args.num_hard_neg  # [batch_size, 1]
@@ -271,7 +266,7 @@ class Model(nn.Module):
     def compute_weighted_negative_scores_mixed(self, drugEmbeds, hard_negEmbeds, weights):
         """
         计算混合加权的负样本分数（支持一跳和二跳邻居不同权重）
-        
+
         参数:
         drugEmbeds: [batch_size, 128] - 药物嵌入
         hard_negEmbeds: [batch_size, num_hard_neg, 128] - 困难负样本嵌入
@@ -290,7 +285,7 @@ class Model(nn.Module):
 
         # 应用混合权重 - 每个负样本分数乘以其对应的权重
         weighted_negScores = negScores * weights  # [batch_size, num_hard_neg]
-        
+
         # 求和，保持维度
         weighted_negScores = weighted_negScores.sum(1, keepdim=True)  # [batch_size, 1]
 
@@ -302,60 +297,50 @@ class Model(nn.Module):
         """
         # 对正样本嵌入进行调整
         adjusted_posEmbeds = posEmbeds - 0.01
-        
+
         posScores = innerProduct(drugEmbeds.unsqueeze(1), adjusted_posEmbeds.unsqueeze(1))  # [batch_size, 1]
-        hard_negative_scores = self.compute_weighted_negative_scores_mixed(drugEmbeds, hard_negEmbeds, weights) # [batch_size, 1]
-        
+        hard_negative_scores = self.compute_weighted_negative_scores_mixed(drugEmbeds, hard_negEmbeds,
+                                                                           weights)  # [batch_size, 1]
+
         x = (posScores / (posScores + hard_negative_scores)).mean()
         loss = -t.log(x.clamp(min=1e-8))
-        
+
         return loss
 
-    #困难负样本损失
+    # 困难负样本损失
     def batch_bias_hard(self, drugEmbeds, posEmbeds, hard_negEmbeds, hard_prob):
         """
         困难负样本损失（简化版本）
         """
         # 对正样本嵌入进行调整，减少0.01来驱动负样本学习
         adjusted_posEmbeds = posEmbeds - 0.01
-        
+
         posScores = innerProduct(drugEmbeds.unsqueeze(1), adjusted_posEmbeds.unsqueeze(1))  # [batch_size, 1]
-        hard_negative_scores = self.compute_weighted_negative_scores(drugEmbeds, hard_negEmbeds, hard_prob) # [batch_size, 1]
-        
+        hard_negative_scores = self.compute_weighted_negative_scores(drugEmbeds, hard_negEmbeds,
+                                                                     hard_prob)  # [batch_size, 1]
+
         x = (posScores / (posScores + hard_negative_scores)).mean()
         loss = -t.log(x.clamp(min=1e-8))  # 只保留基本的数值稳定性
-        
+
         return loss
 
-    #计算交叉熵损失
+    # 计算交叉熵损失
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        # 获取模型输出  embeds用于预测，gcnEmbedsLst, causalEmbedsLst用于进行因果对比学习
-        embeds, gcnEmbedsLst, causalEmbedsLst = self.forward(adj, keepRate)
+        embeds = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
-        # 选择相关的药物和基因嵌入
-        dEmbeds = dEmbeds[drugs]
+        # Select drug and gene embeddings based on input indices
+        dEmbeds = dEmbeds[drugs]  # ([4096, 128])
         gEmbeds = gEmbeds[genes]
 
-        # 计算交叉熵损失
+        # Calculate Cross-Entropy loss   torch.Size([4096, 14]) 或 torch.Size([4096, 2])
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
-        # 计算自监督对比学习损失
-        # 使用普通GCN和因果GCN的输出进行对比学习
-        sslLoss = 0
-        for i in range(1, args.gnn_layer + 1, 1):
-            # 获取普通GCN的特征（作为锚点）
-            embeds1 = gcnEmbedsLst[i].detach()
-            # 获取因果GCN的特征（作为正样本）
-            embeds2 = causalEmbedsLst[i]
-            # 分别计算药物和基因的对比损失
-            sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
-                                    args.temp) + contrastLoss(
-                embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
-        return ceLoss, sslLoss
+        return ceLoss
+
     def predict(self, adj, drugs, genes):
-        embeds, _, _ = self.forward(adj, 1.0)
+        embeds = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
@@ -367,20 +352,23 @@ class Model(nn.Module):
         return pre
 
     def getEmbeds(self):
-        self.unfreeze(self.gcnLayers)
+        self.unfreeze(self.gcnLayer)
         return t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
     def unfreeze(self, layer):
         for child in layer.children():
             for param in child.parameters():
                 param.requires_grad = True
-    def getGCN(self):
-        return self.gcnLayers
 
-#Define the GCN (Graph Convolutional Network) layer
+    def getGCN(self):
+        return self.gcnLayer
+
+
+# Define the GCN (Graph Convolutional Network) layer
 class GCNLayer(nn.Module):
     def __init__(self):
         super(GCNLayer, self).__init__()
+
     def forward(self, adj, embeds, flag=True):
         if (flag):
             return t.spmm(adj, embeds)
