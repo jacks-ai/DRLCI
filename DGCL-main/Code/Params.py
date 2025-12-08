@@ -15,7 +15,7 @@ def ParseArgs():
     parser.add_argument('--keepRate', default=0.75, type=float, help='ratio of edges to keep')
     parser.add_argument('--temp', default=0.1, type=float, help='temperature')
     parser.add_argument('--mult', default=1e-1, type=float, help='multiplication factor')
-    parser.add_argument('--ssl_reg', default=1e-2, type=float, help='weight for ssl（Self-Supervised Learning） loss')
+    parser.add_argument('--ssl_reg', default=1e-5, type=float, help='weight for ssl（Self-Supervised Learning） loss')
     parser.add_argument('--data', default='DrugBank', type=str, help='DrugBank DGIdb name of dataset')
     parser.add_argument('--tstEpoch', default=1, type=int, help='number of epoch to test while training')
     parser.add_argument('--gpu', default='0', type=int, help='indicates which gpu to use')
@@ -34,9 +34,9 @@ def ParseArgs():
     parser.add_argument('--num_two_hop', type=int, default=30, help='每个基因选择的二跳邻居数量')
     parser.add_argument('--one_hop_max_ratio', type=float, default=0.1, help='一跳邻居在困难负样本中的最大比例')
 
-    parser.add_argument('--one_hop_weight', type=float, default=1.8, help='一跳困难负样本权重倍数')
+    parser.add_argument('--one_hop_weight', type=float, default=1.5, help='一跳困难负样本权重倍数')
     parser.add_argument('--two_hop_weight', type=float, default=1, help='二跳困难负样本权重倍数')
-    parser.add_argument('--common_neg_weight', type=float, default=0.4, help='二跳困难负样本权重倍数')
+    parser.add_argument('--common_neg_weight', type=float, default=0.7, help='二跳困难负样本权重倍数')
 
     parser.add_argument('--clip_grad_norm', type=float, default=5.0, help='梯度裁剪的最大范数')
     parser.add_argument('--score_clamp_min', type=float, default=-10.0, help='分数裁剪的最小值，防止exp爆炸')

@@ -193,25 +193,52 @@ class Model(nn.Module):
         self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
 
     def forward(self, adj, keepRate):
-        # Concatenate drug and gene embeddings
-        embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+        if adj.is_sparse:
+            adj_dropped = adj.to_dense()  # Convert sparse matrix to dense
+        embeds = t.cat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [embeds]
         gcnEmbedsLst = [embeds]
-        # hyperEmbedsLst = [embeds]
-        for gcn in self.gcnLayers:
-            embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+        causalEmbedsLst = [embeds]
+        embeds_3d = t.unsqueeze(embeds, 0)  # 在0维位置增加一个维度
+        input = embeds_3d
 
-            gcnEmbedsLst.append(embeds)
-            embedsLst.append(embeds)
-        # Sum all embeddings
+        # 因果干预在这里实现
+        for i in range(args.gnn_layer):
+            # 1. 普通图卷积传递
+            gcnEmbeds = self.gcnLayer(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            se_weights = self.seLayer(gcnEmbeds)
+            gcnEmbedsLst.append(gcnEmbeds)
+
+            # 2. 特征增强：结合SE注意力和残差连接   Global information modeling
+            adjusted_embeds = t.add(gcnEmbeds, se_weights)
+            # 这里是残差连接，将当前层输出与上一层输入相加
+            adjusted_embeds1 = t.add(gcnEmbeds, embedsLst[-1])
+            ae = t.add(adjusted_embeds, adjusted_embeds1)
+
+            # 3. 因果感知的图卷积传递
+            gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj)  # 使用因果图卷积层处理
+            gcnEmbeds_c = gcnEmbeds_c.squeeze(0)  # 压缩维度
+            causalEmbedsLst.append(gcnEmbeds_c)
+
+            # 4. 因果特征增强：使用SE注意力进行特征重标定
+            gcnEmbeds_c2 = self.seLayer(gcnEmbeds_c)
+            gcnEmbeds_c = t.mul(gcnEmbeds_c2, gcnEmbeds_c)
+
+            # 5. 特征融合：组合普通GCN和因果GCN的特征
+            xsc = t.add(ae, gcnEmbeds_c)
+            embedsLst.append(xsc)
+
+        # 6. 聚合所有层的特征
         embeds = sum(embedsLst)
-        return embeds, gcnEmbedsLst
-    #用于模型生成药物与基因嵌入
+        return embeds, gcnEmbedsLst, causalEmbedsLst
+    # embeds中可以得到药物基因嵌入，gcnEmbedsLst目前没咋用（他俩区别就是是否有做一个sum操作）
+    # 用于模型生成药物与基因嵌入  在 trainEpoch 中使用 无（无 dropout）
     def forward_gcn(self, adj):
         iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
         embedsLst = [iniEmbeds]
         for gcn in self.gcnLayers:
+            # embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
             embeds = gcn(adj, embedsLst[-1])
             embedsLst.append(embeds)
         mainEmbeds = sum(embedsLst)
@@ -302,21 +329,33 @@ class Model(nn.Module):
 
     #计算交叉熵损失
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds, gcnEmbedsLst = self.forward(adj, keepRate)
+        # 获取模型输出  embeds用于预测，gcnEmbedsLst, causalEmbedsLst用于进行因果对比学习
+        embeds, gcnEmbedsLst, causalEmbedsLst = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
-        # Select drug and gene embeddings based on input indices
-        dEmbeds = dEmbeds[drugs]  # ([4096, 128])
+        # 选择相关的药物和基因嵌入
+        dEmbeds = dEmbeds[drugs]
         gEmbeds = gEmbeds[genes]
 
-
-        # Calculate Cross-Entropy loss   torch.Size([4096, 14]) 或 torch.Size([4096, 2])
+        # 计算交叉熵损失
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
-        return ceLoss
+        # 计算自监督对比学习损失
+        # 使用普通GCN和因果GCN的输出进行对比学习
+        sslLoss = 0
+        for i in range(1, args.gnn_layer + 1, 1):
+            # 获取普通GCN的特征（作为锚点）
+            embeds1 = gcnEmbedsLst[i].detach()
+            # 获取因果GCN的特征（作为正样本）
+            embeds2 = causalEmbedsLst[i]
+            # 分别计算药物和基因的对比损失
+            sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
+                                    args.temp) + contrastLoss(
+                embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
+        return ceLoss, sslLoss
     def predict(self, adj, drugs, genes):
-        embeds, _ = self.forward(adj, 1.0)
+        embeds, _, _ = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices

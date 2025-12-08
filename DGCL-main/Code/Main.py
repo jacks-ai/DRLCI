@@ -10,10 +10,9 @@ from DataHandler import DataHandler
 from Utils.Utils import *
 from multiprocess_helper_optimized import init_worker_process, compute_single_pair_optimized
 from preprocess_drug_gene_dict import load_drug_gene_dict
-
 import os
 import torch.nn.functional as F
-
+from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import accuracy_score
 
 import numpy as np
@@ -440,7 +439,7 @@ class Coach:
             # 减少进程数，避免过多的进程创建开销
             cpu_count = multiprocessing.cpu_count()
             # max_workers = min(max(1, int(cpu_count * 0.5)), 24)  # 使用50%的CPU，最多16进程
-            max_workers=32
+            max_workers=24
             print(f"💻 Using {max_workers} processes (CPU cores: {cpu_count})")
 
             # 准备共享数据（只传输一次）
@@ -755,8 +754,9 @@ class Coach:
                     cached_negatives = cached_data['negatives']
                     
                     if 'one_hop_count' in cached_data:
+
                         # DrugBank的新格式：动态重建权重
-                        one_hop_count = cached_data['one_hop_count']
+                        one_hop_count = cached_data['one_hop_count']#one_hop_count 3
                         num_negatives = len(cached_negatives)
                         reconstructed_weights = ([args.one_hop_weight] * one_hop_count) + \
                                                 ([args.two_hop_weight] * (num_negatives - one_hop_count))
@@ -959,7 +959,7 @@ class Coach:
         if current_epoch == 0:
             print("开始生成普通负样本")
         # 这一步如果在DataHandler中就执行会牺牲随机性
-        trnLoader.dataset.negSampling() #这一步非常消耗时间，改多线程生成
+        trnLoader.dataset.negSampling(drug_gene_dict) #这一步非常消耗时间，改多线程生成
 
         # 重置epoch级别的二跳邻居统计
         self.epoch_two_hop_stats = {
@@ -984,6 +984,7 @@ class Coach:
             genes = genes.long().cuda()
             labels = labels.long().cuda()
             negs = negs.long().cuda()
+            # 得到嵌入用于计算负采样损失
             usrEmbeds, itmEmbeds = self.get_model().forward_gcn(data)
             # 获取正样本和负样本的嵌入
             drugEmbeds = usrEmbeds[drugs]  # 药物嵌入 4096 128
@@ -996,13 +997,6 @@ class Coach:
             mixed_hard_negatives = mixed_hard_negatives.cuda()
             neg_weights = neg_weights.cuda()
             mixed_hard_neg_embeds = itmEmbeds[mixed_hard_negatives]  # [batch_size, num_two_hop, 128]
-
-            # 在最后5个epoch时进行实时统计
-            if current_epoch >= args.epoch - 0:
-                batch_stats = self.compute_real_time_statistics(drugs.cpu(), genes.cpu(), args.num_two_hop)
-                # 累加到epoch统计中
-                for situation, count in batch_stats.items():
-                    self.epoch_two_hop_stats[situation] += count
 
             if current_epoch == 0 and i==0:
                 print(f"Mixed hard negatives shape: {mixed_hard_neg_embeds.shape}")
@@ -1062,34 +1056,9 @@ class Coach:
                 
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
-                
-                # 课程学习策略：前10个epoch只用普通负样本，之后再加入困难负样本
-                if current_epoch < 0:
-                    # 前10个epoch：只使用普通负样本损失
-                    neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss
-                    # neg_total_loss.backward()
-                    
-                    # 计算总损失用于记录（不包含困难负样本）
-                    total_loss = neg_loss_value * args.common_neg_weight + regLoss
-                    
-                    if current_epoch == 0 and i == 0:
-                        print(f"🎓 Curriculum Learning: Epoch {current_epoch} - Using only common negatives")
-                else:
-                    # 第10个epoch之后：同时使用困难负样本和普通负样本
-                    # 第一步：困难负样本损失反向传播（保留计算图）
-                    hard_total_loss = hard_loss_value + regLoss * 0.5  # 分摊正则化损失
-                    # hard_total_loss.backward(retain_graph=True)
-                    
-                    # 第二步：普通负样本损失反向传播（累积梯度）
-                    neg_total_loss = neg_loss_value * args.common_neg_weight + regLoss * 0.5
-                    # neg_total_loss.backward()
-                    
-                    # 计算总损失用于记录
-                    total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
-                    
-                    if current_epoch == 10 and i == 0:
-                        print(f"🎓 Curriculum Learning: Epoch {current_epoch} - Now including hard negatives!")
-                
+                # 计算总损失用于记录
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+
                 # 统一参数更新（基于累积的梯度）
                 total_loss.backward()
                 self.opt.step()
@@ -1110,11 +1079,11 @@ class Coach:
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 计算交叉熵损失
-            ceLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
-            # sslLoss = sslLoss * args.ssl_reg
+            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            sslLoss = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
-            # loss = ceLoss + regLoss + sslLoss
-            loss = ceLoss + regLoss
+            loss = ceLoss + regLoss + sslLoss
+            # loss = ceLoss + regLoss
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
@@ -1129,20 +1098,6 @@ class Coach:
             self.opt.step()
             #bprLoss = 0
             regLoss = 0
-        
-        # 只在最后5个epoch统计并输出二跳邻居筛选情况
-        if current_epoch >= args.epoch - 5:
-            total_samples = sum(self.epoch_two_hop_stats.values())
-            if total_samples > 0:
-                print(f"\n📊 Epoch {current_epoch} Two-hop Neighbor Statistics (Total samples: {total_samples}):")
-                print(f"  情况1 - 足够的二跳邻居: {self.epoch_two_hop_stats['enough_filtered']} ({self.epoch_two_hop_stats['enough_filtered']/total_samples*100:.1f}%)")
-                print(f"  情况2 - 部分二跳邻居: {self.epoch_two_hop_stats['some_filtered']} ({self.epoch_two_hop_stats['some_filtered']/total_samples*100:.1f}%)")
-                print(f"  情况3 - 足够的无交互基因: {self.epoch_two_hop_stats['enough_random']} ({self.epoch_two_hop_stats['enough_random']/total_samples*100:.1f}%)")
-                print(f"  情况4 - 极端情况重复采样: {self.epoch_two_hop_stats['few_random']} ({self.epoch_two_hop_stats['few_random']/total_samples*100:.1f}%)")
-            
-            # 累加到总统计中
-            for key in self.two_hop_stats:
-                self.two_hop_stats[key] += self.epoch_two_hop_stats[key]
             
         ret = dict()
         ret['Loss'] = epLoss / steps
@@ -1158,7 +1113,7 @@ class Coach:
         self.model.eval()
         tstLoader = self.handler.tstLoader
         i = 0
-        for tem in tstLoader:
+        for tem in tstLoader:  #  for i, tem in enumerate(trnLoader)
             i += 1
             drugs, genes, labels = tem
             # 将从数据集获得的张量转移到Gpu上面，默认第一个Gpu
@@ -1167,6 +1122,8 @@ class Coach:
             labels = labels.long().cuda()
             # predict(self, adj, drugs, genes)
             pre = self.get_model().predict(self.handler.torchBiAdj, drugs, genes)
+
+
             # dim=1 指定了 softmax 操作沿着第 1 维（即类别维度）进行
             pre = F.log_softmax(pre, dim=1)
             # 选出可能性最大的类别，优化GPU->CPU传输
@@ -1175,6 +1132,8 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
+
         ret = dict()
         ret['Acc'] = epAcc
         return ret
@@ -1256,8 +1215,24 @@ if __name__ == '__main__':
     handler = DataHandler()
     handler.LoadData()
     drug_gene_dict, _ = load_drug_gene_dict(args.data)
-    handler.trnLoader.dataset.positive_genes_dict = drug_gene_dict
+    if drug_gene_dict is None:
+        raise RuntimeError("读取drug_gene_dict缓存失败!!!!")
+
     log('Load Data')
+    
+    # 输出关键超参数信息
+    print("\n" + "="*60)
+    print("🔧 实验超参数配置信息")
+    print("="*60)
+    print(f"📊 数据集 (data): {args.data}")
+    print(f"📈 学习率 (lr): {args.lr}")
+    print(f"🎲 全局负样本数量 (num_neg): {args.num_neg}")
+    print(f"🔗 二跳邻居数量 (num_two_hop): {args.num_two_hop}")
+    print(f"📏 一跳最大比例 (one_hop_max_ratio): {args.one_hop_max_ratio:.1%} ({int(args.num_two_hop * args.one_hop_max_ratio)} max samples)")
+    print(f"⚖️  一跳权重倍数 (one_hop_weight): {args.one_hop_weight}")
+    print(f"⚖️  二跳权重倍数 (two_hop_weight): {args.two_hop_weight}")
+    print(f"⚖️  普通负样本权重 (common_neg_weight): {args.common_neg_weight}")
+    print("="*60 + "\n")
 
     coach = Coach(handler)
     config = dict()
@@ -1311,13 +1286,7 @@ if __name__ == '__main__':
     # 统计有效结果和NAN结果
     valid_results = [r for r in results if not np.isnan(r)]
     valid_aucMax_list = [a for a in aucMax_list if not np.isnan(a)]
-    nan_count = len(results) - len(valid_results)
-    
-    print(f"\n📊 Training Summary:")
-    print(f"Total iterations: {len(results)}")
-    print(f"Successful iterations: {len(valid_results)}")
-    print(f"NAN iterations: {nan_count}")
-    
+
     if len(valid_results) > 0:
         avg_r = np.mean(np.array(valid_results), axis=0)
         std_r = np.std(valid_results, axis=0)  # 求标准差
