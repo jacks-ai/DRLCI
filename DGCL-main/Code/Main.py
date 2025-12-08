@@ -78,9 +78,9 @@ class Coach:
         self.iteration_two_hop_stats = []
         
         # 新增：构建基因邻接关系用于二跳邻居查找,只需要执行一次
-        # print("Building gene-gene adjacency matrix for two-hop neighbors...")
-        # self.build_gene_adjacency_matrix()
-        # print("Gene adjacency matrix built successfully!")
+        print("Building gene-gene adjacency matrix for two-hop neighbors...")
+        self.build_gene_adjacency_matrix()
+        print("Gene adjacency matrix built successfully!")
         
         # 设置混合困难负样本缓存文件路径
         cache_dir = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/cache"
@@ -1079,10 +1079,10 @@ class Coach:
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 计算交叉熵损失
-            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
-            sslLoss = sslLoss * args.ssl_reg
+            ceLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            # sslLoss = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
-            loss = ceLoss + regLoss + sslLoss
+            loss = ceLoss + regLoss
             # loss = ceLoss + regLoss
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
@@ -1132,7 +1132,9 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
+            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted')
+
+            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
 
         ret = dict()
         ret['Acc'] = epAcc
