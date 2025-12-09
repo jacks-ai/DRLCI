@@ -71,7 +71,11 @@ class Causal_GraphConvolution(nn.Module):
         Wh2 = t.matmul(Wh, self.a[self.out_features:, :])
         # 组合注意力分数（广播加法）
         e = Wh1 + Wh2.T
-        return self.act(e)
+        # 数值稳定性：使用LeakyReLU而不是ReLU，并进行值范围限制
+        e = F.leaky_relu(e, negative_slope=0.2)
+        # 限制注意力分数范围，防止数值爆炸
+        e = t.clamp(e, min=-10.0, max=10.0)
+        return e
 
     def forward(self, input, adj):
         """
@@ -98,20 +102,30 @@ class Causal_GraphConvolution(nn.Module):
         for inp in t.unbind(input, dim=0):
             # 线性特征变换
             Wh = t.mm(inp, self.weight)
+            # 数值稳定性：限制Wh的范围
+            Wh = t.clamp(Wh, min=-10.0, max=10.0)
+            
             # 计算因果注意力分数
             e = self._prepare_causality_attention_input(Wh)
 
             # 创建注意力掩码，将不相连节点的注意力设为很小的负值
-            zero_vec = -5e4 * t.ones_like(e)
+            zero_vec = -1e4 * t.ones_like(e)  # 减小掩码值，避免softmax溢出
             adj_dense = adj.to_dense()  # 将稀疏邻接矩阵转换为稠密矩阵
             # 应用邻接矩阵掩码，只保留相连节点间的注意力
             attention = t.where(adj_dense > 0, e, zero_vec)
 
-            # 注意力归一化
+            # 注意力归一化 - 添加数值稳定性检查
             attention = F.softmax(attention, dim=1)
+            # 检查是否产生NaN
+            if t.isnan(attention).any():
+                # 如果softmax产生NaN，使用均匀注意力作为fallback
+                attention = t.ones_like(attention) / attention.shape[1]
+            
             attention = F.dropout(attention, self.dropout, training=self.training)
             # 基于注意力权重聚合邻居信息 这里就是计算出来的P
             h_prime = t.matmul(attention, Wh)
+            # 数值稳定性：限制输出范围
+            h_prime = t.clamp(h_prime, min=-10.0, max=10.0)
             Whs.append(h_prime)
 
         # 堆叠所有处理后的样本
@@ -125,8 +139,10 @@ class Causal_GraphConvolution(nn.Module):
             [t.spmm(adj, sup) for sup in t.unbind(support, dim=0)],
             dim=0)
 
-        # 应用激活函数
+        # 应用激活函数并进行数值稳定性检查
         output = self.act(output)
+        # 限制最终输出范围
+        output = t.clamp(output, min=-10.0, max=10.0)
         return output
 
     def __repr__(self):
@@ -199,6 +215,9 @@ class Model(nn.Module):
         for i in range(args.gnn_layer):
             # 1. 普通图卷积传递
             gcnEmbeds = self.gcnLayer(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            # 数值稳定性：限制GCN输出范围
+            gcnEmbeds = t.clamp(gcnEmbeds, min=-10.0, max=10.0)
+            
             se_weights = self.seLayer(gcnEmbeds)
             gcnEmbedsLst.append(gcnEmbeds)
 
@@ -207,24 +226,34 @@ class Model(nn.Module):
             # 这里是残差连接，将当前层输出与上一层输入相加
             adjusted_embeds1 = t.add(gcnEmbeds, embedsLst[-1])
             ae = t.add(adjusted_embeds, adjusted_embeds1)
+            # 数值稳定性：限制中间特征范围
+            ae = t.clamp(ae, min=-10.0, max=10.0)
 
             # 3. 因果感知的图卷积传递
             # 为因果图卷积准备3D输入 [batch_size=1, num_nodes, latdim]
             embeds_3d = t.unsqueeze(embedsLst[-1], 0)
             gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj)  # 使用因果图卷积层处理
             gcnEmbeds_c = gcnEmbeds_c.squeeze(0)  # 压缩维度
+            # 数值稳定性：限制因果GCN输出范围
+            gcnEmbeds_c = t.clamp(gcnEmbeds_c, min=-10.0, max=10.0)
             causalEmbedsLst.append(gcnEmbeds_c)
 
             # 4. 因果特征增强：使用SE注意力进行特征重标定
             gcnEmbeds_c2 = self.seLayer(gcnEmbeds_c)
             gcnEmbeds_c = t.mul(gcnEmbeds_c2, gcnEmbeds_c)
+            # 数值稳定性：限制特征重标定后的范围
+            gcnEmbeds_c = t.clamp(gcnEmbeds_c, min=-10.0, max=10.0)
 
             # 5. 特征融合：组合普通GCN和因果GCN的特征
             xsc = t.add(ae, gcnEmbeds_c)
+            # 数值稳定性：限制融合后的特征范围
+            xsc = t.clamp(xsc, min=-10.0, max=10.0)
             embedsLst.append(xsc)
 
         # 6. 聚合所有层的特征
         embeds = sum(embedsLst)
+        # 最终数值稳定性检查
+        embeds = t.clamp(embeds, min=-50.0, max=50.0)
         return embeds
 
     # 用于模型生成药物与基因嵌入
