@@ -60,6 +60,8 @@ class Coach:
         for met in mets:
             self.metrics['Train' + met] = list()
             self.metrics['Test' + met] = list()
+
+        self.metrics_to_track = ['Acc', 'F1', 'AUC', 'precision', 'recall', 'Auprc']
         
         # 新增：二跳邻居筛选情况统计
         self.two_hop_stats = {
@@ -143,8 +145,22 @@ class Coach:
         epoch_list = []
         acc_list = []
 
+        best_metrics = {met: {'value': float('-inf'), 'epoch': -1} for met in self.metrics_to_track}
+
+        def update_best_metrics(result_dict, epoch_idx):
+            for metric in self.metrics_to_track:
+                metric_value = result_dict.get(metric)
+                if metric_value is None or np.isnan(metric_value):
+                    continue
+                if metric_value > best_metrics[metric]['value']:
+                    best_metrics[metric]['value'] = metric_value
+                    best_metrics[metric]['epoch'] = epoch_idx
+
+
         aucMax = 0
         bestEpoch = 0
+
+        test_r = {met: float('nan') for met in self.metrics_to_track}
 
         for ep in range(stloc, args.epoch):
             tstFlag = (ep % args.tstEpoch == 0)
@@ -201,6 +217,7 @@ class Coach:
 
                 # 记录测试结果
                 log(self.makePrint('Test', ep, reses, tstFlag))
+                update_best_metrics(reses, ep)
             logs = {'loss_all': train_loss['Loss'], 'loss_pre': train_loss['preLoss'],
                     'test_acc': test_r['Acc']}
             epoch_list.append(ep)
@@ -214,6 +231,8 @@ class Coach:
 
         reses = self.testEpoch()
         log(self.makePrint('Test', args.epoch, reses, True))
+        update_best_metrics(reses, args.epoch)
+
         self.save_model('{}'.format(config['iteration']))
         
         # 计算当前iteration的二跳邻居统计
@@ -244,9 +263,37 @@ class Coach:
         }
         
         # 每轮itration结束补充输出一个最好的结果
-        output_str = f'Best epoch : {bestEpoch} , ACC : {round(aucMax, 4)}'
-        print(output_str)
-        return reses['Acc'],output_str,aucMax
+        best_lines = []
+        acc_best_epoch = best_metrics['Acc']['epoch']
+        if acc_best_epoch != -1:
+            aucMax = best_metrics['Acc']['value']
+            bestEpoch = acc_best_epoch
+        else:
+            aucMax = float('nan')
+            bestEpoch = -1
+        output_str = f'Best epoch : {bestEpoch} , ACC : {round(aucMax, 4) if not np.isnan(aucMax) else "N/A"}'
+        best_lines.append(output_str)
+
+        for metric in self.metrics_to_track:
+            if metric == 'Acc':
+                continue
+            best_value = best_metrics[metric]['value']
+            best_epoch = best_metrics[metric]['epoch']
+            if best_epoch == -1:
+                best_lines.append(f'Best epoch for {metric} : N/A , {metric} : N/A')
+            else:
+                best_lines.append(
+                    f'Best epoch for {metric} : {best_epoch} , {metric} : {round(best_value, 4)}'
+                )
+
+        print('\n'.join(best_lines))
+
+        iteration_best_metrics = {
+            metric: (best_metrics[metric]['value'] if best_metrics[metric]['epoch'] != -1 else float('nan'))
+            for metric in self.metrics_to_track
+        }
+
+        return reses['Acc'],output_str,aucMax,iteration_best_metrics
 
     # Function to prepare the model and optimizer
     def prepareModel(self):
@@ -1126,11 +1173,9 @@ class Coach:
             genes = genes.long().cuda()
             labels = labels.long().cuda()
             # predict(self, adj, drugs, genes)
-            pre = self.get_model().predict(self.handler.torchBiAdj, drugs, genes)
-
-
+            pre_logits = self.get_model().predict(self.handler.torchBiAdj, drugs, genes)
             # dim=1 指定了 softmax 操作沿着第 1 维（即类别维度）进行
-            pre = F.log_softmax(pre, dim=1)
+            pre = F.log_softmax(pre_logits, dim=1)
             # 选出可能性最大的类别，优化GPU->CPU传输
             pre = pre.data.max(1, keepdim=True)[1]
             # 批量转移到CPU，减少传输次数
@@ -1140,8 +1185,8 @@ class Coach:
             precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted')
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
-            probs = F.softmax(pre, dim=1)  # 使用softmax获取概率
-            probs_list.append(probs.cpu().numpy())
+            probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
+            probs_list.append(probs.cpu().detach().numpy())
 
         all_labels = np.concatenate(labels_list)
         all_probs = np.vstack(probs_list)  # 所有预测概率
@@ -1297,6 +1342,7 @@ if __name__ == '__main__':
     output_str = None
     it_max=0
     aucMax=0
+    overall_iteration_best = {met: [] for met in coach.metrics_to_track}
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
         seed = args.seed + i
@@ -1306,7 +1352,7 @@ if __name__ == '__main__':
         if args.data == 'LINCS':
             result = coach.external_test_run()
         else:
-            result,output_str,aucMax = coach.run(i)  # 返回最终测试得到的reses['Acc']
+            result,output_str,aucMax,iteration_best_metrics = coach.run(i)  # 返回最终测试得到的reses['Acc']
             
         # 处理NAN结果：记录但继续下一个iteration
         if np.isnan(result):
@@ -1320,6 +1366,9 @@ if __name__ == '__main__':
         results.append(result)
         aucMax_list.append(aucMax)
         outputstr_list.append(output_str)
+        for metric in coach.metrics_to_track:
+            metric_value = iteration_best_metrics.get(metric, float('nan'))
+            overall_iteration_best[metric].append(metric_value)
         
         # 只有非NAN的aucMax才更新it_max
         if not np.isnan(aucMax) and aucMax > it_max:
@@ -1349,6 +1398,16 @@ if __name__ == '__main__':
         print('有效结果平均最大值: {}'.format(avg_aucMax))
         print('所有iteration最大值: {}'.format(it_max))
         print('有效结果方差: {}'.format(std_r))
+
+    print('\n📊 Iteration-level best metric summary:')
+    for metric, values in overall_iteration_best.items():
+        valid_vals = [val for val in values if not np.isnan(val)]
+        if len(valid_vals) == 0:
+            print(f'  {metric}: 无有效迭代结果')
+            continue
+        avg_best = np.mean(valid_vals)
+        max_best = np.max(valid_vals)
+        print(f'  {metric}: 平均最佳 = {avg_best:.4f}, 最高最佳 = {max_best:.4f}')
     else:
         print("❌ All iterations resulted in NAN!")
         avg_r = float('nan')
