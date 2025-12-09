@@ -12,8 +12,11 @@ from multiprocess_helper_optimized import init_worker_process, compute_single_pa
 from preprocess_drug_gene_dict import load_drug_gene_dict
 import os
 import torch.nn.functional as F
+
+from sklearn.metrics import accuracy_score, average_precision_score
 from sklearn.metrics import precision_recall_fscore_support
-from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import roc_auc_score
 
 import numpy as np
 import random
@@ -1112,6 +1115,8 @@ class Coach:
     def testEpoch(self):
         self.model.eval()
         tstLoader = self.handler.tstLoader
+        labels_list = []
+        probs_list = []  # 新增：用于存储预测概率
         i = 0
         for tem in tstLoader:  #  for i, tem in enumerate(trnLoader)
             i += 1
@@ -1132,13 +1137,55 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
-            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted')
-
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted')
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
+            labels_list.append(labels.cpu().numpy())
+            probs = F.softmax(pre, dim=1)  # 使用softmax获取概率
+            probs_list.append(probs.cpu().numpy())
 
-        ret = dict()
-        ret['Acc'] = epAcc
+        all_labels = np.concatenate(labels_list)
+        all_probs = np.vstack(probs_list)  # 所有预测概率
+        auprc=0
+
+        # 计算AUC，根据数据集类型
+        if args.data == 'DGIdb':
+            # 多分类AUC（one-vs-rest）
+            # 对于不平衡数据集，通常推荐使用 'macro'
+            # 原因：你关心的是所有类别（包括少数类）的表现是否均衡。如果使用
+            # 'weighted'，模型可能在多数类上表现好就拉高整体分数，掩盖了对少数类的糟糕预测。
+            try:
+                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
+                num_classes = all_probs.shape[1]
+                y_true_bin = label_binarize(all_labels, classes=range(num_classes))
+                auprc = average_precision_score(y_true_bin, all_probs, average='macro')
+            except ValueError as e:
+                print(f"计算多分类AUC时出错: {e}")
+                auc_score = 0.0
+        elif args.data == 'DrugBank':
+            # 二分类AUC
+            try:
+                auc_score = roc_auc_score(all_labels, all_probs[:, 1])  # 使用正类的概率
+                auprc = average_precision_score(all_labels, all_probs[:, 1])
+            except ValueError as e:
+                print(f"计算二分类AUC时出错: {e}")
+                auc_score = 0.0
+        else:
+            # 默认尝试二分类
+            try:
+                auc_score = roc_auc_score(all_labels, all_probs[:, 1] if all_probs.shape[1] > 1 else all_probs)
+            except:
+                auc_score = 0.0
+
+        # 绘制散点密度图
+        # self.plot_scatter(all_labels, all_predictions, epoch)
+
+        # 调用 plot_tSNE，并传递保存路径
+        # self.plot_tSNE(all_features, all_labels, epoch, self.plot_save_path)
+
+        ret = {'Acc': epAcc, 'F1': f1, 'AUC': auc_score,
+               'precision': precision, 'recall': recall,'Auprc':auprc}
         return ret
+
 
     # Function to load a pre-trained model
     def loadModel(self):
