@@ -172,19 +172,19 @@ class Coach:
                 print("❌ NAN detected in training results! Stopping current iteration early...")
                 print(f"Training stopped at epoch {ep}")
                 print(f"NAN detected in training losses: {reses}")
-                
+                nan_metrics = {metric: float('nan') for metric in self.metrics_to_track}
                 # 输出到目前为止的最佳结果
                 if bestEpoch > 0:
                     output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. Best epoch so far: {bestEpoch}, ACC: {round(aucMax, 4)}'
                     print(output_str)
                     # 返回当前最佳结果，继续下一个iteration
-                    return aucMax, output_str, aucMax
+                    return aucMax, output_str, aucMax, nan_metrics
                 else:
                     output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                     print(output_str)
                     print("➡️ Continuing to next iteration...")
                     # 没有有效结果，返回NAN，但继续下一个iteration
-                    return float('nan'), output_str, float('nan')
+                    return float('nan'), output_str, float('nan'), nan_metrics
             
             # 记录训练结果
             log(self.makePrint('Train', ep, reses, tstFlag))
@@ -197,19 +197,19 @@ class Coach:
                     print("❌ NAN detected in test results! Stopping current iteration early...")
                     print(f"Training stopped at epoch {ep}")
                     print(f"NAN detected in test results: {reses}")
-                    
+                    nan_metrics = {metric: float('nan') for metric in self.metrics_to_track}
                     # 输出到目前为止的最佳结果
                     if bestEpoch > 0:
                         output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. Best epoch so far: {bestEpoch}, ACC: {round(aucMax, 4)}'
                         print(output_str)
                         # 返回当前最佳结果，继续下一个iteration
-                        return aucMax, output_str, aucMax
+                        return aucMax, output_str, aucMax, nan_metrics
                     else:
                         output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                         print(output_str)
                         print("➡️ Continuing to next iteration...")
                         # 没有有效结果，返回NAN，但继续下一个iteration
-                        return float('nan'), output_str, float('nan')
+                        return float('nan'), output_str, float('nan'), nan_metrics
 
                 if reses['Acc'] > aucMax:
                     aucMax = reses['Acc']
@@ -732,7 +732,7 @@ class Coach:
 
     def build_gene_adjacency_matrix(self):
         """
-        构建基因-基因邻接矩阵
+        构建基因-基因邻接矩阵 一跳邻居
         基于药物-基因交互关系：如果两个基因都与同一个药物有交互，则认为它们间接相关
         """
         # 获取药物-基因交互矩阵 (稀疏矩阵格式)
@@ -1129,11 +1129,11 @@ class Coach:
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 计算交叉熵损失
-            ceLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
-            # sslLoss = sslLoss * args.ssl_reg
+            ceLoss,sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            sslLoss_reg = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
-            loss = ceLoss + regLoss
             # loss = ceLoss + regLoss
+            loss = ceLoss + regLoss + sslLoss_reg
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
@@ -1148,9 +1148,10 @@ class Coach:
             self.opt.step()
             #bprLoss = 0
             regLoss = 0
-            
+
         ret = dict()
         ret['Loss'] = epLoss / steps
+        ret['sslLoss'] = sslLoss / steps
         ret['preLoss'] = epPreLoss / steps
         ret['common_neg_loss'] = common_loss / steps
         ret['hard_neg_loss'] = hard_loss / steps
@@ -1182,7 +1183,7 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted')
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
@@ -1407,7 +1408,11 @@ if __name__ == '__main__':
             continue
         avg_best = np.mean(valid_vals)
         max_best = np.max(valid_vals)
-        print(f'  {metric}: 平均最佳 = {avg_best:.4f}, 最高最佳 = {max_best:.4f}')
+        rounded_vals = [round(val, 4) for val in valid_vals]
+        print(f'  {metric}:')
+        print(f'    平均最佳 = {avg_best:.4f}')
+        print(f'    最高最佳 = {max_best:.4f}')
+        print(f'    所有迭代最佳值 = {rounded_vals}')
     else:
         print("❌ All iterations resulted in NAN!")
         avg_r = float('nan')

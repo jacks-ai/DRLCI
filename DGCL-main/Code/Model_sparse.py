@@ -254,7 +254,7 @@ class Model(nn.Module):
         embeds = sum(embedsLst)
         # 最终数值稳定性检查
         embeds = t.clamp(embeds, min=-50.0, max=50.0)
-        return embeds
+        return embeds, gcnEmbedsLst, causalEmbedsLst
 
     # 用于模型生成药物与基因嵌入
     def forward_gcn(self, adj):
@@ -355,7 +355,7 @@ class Model(nn.Module):
 
     # 计算交叉熵损失
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds = self.forward(adj, keepRate)
+        embeds, gcnEmbedsLst, causalEmbedsLst = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
@@ -366,10 +366,24 @@ class Model(nn.Module):
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
 
-        return ceLoss
+        # 计算自监督对比学习损失
+        # 使用普通GCN和因果GCN的输出进行对比学习
+        sslLoss = 0
+        for i in range(1, args.gnn_layer + 1, 1):
+            # 获取普通GCN的特征（作为锚点）
+            embeds1 = gcnEmbedsLst[i].detach()
+            # 获取因果GCN的特征（作为正样本）
+            embeds2 = causalEmbedsLst[i]
+
+            # 分别计算药物和基因的对比损失
+            sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
+                                    args.temp) + contrastLoss(
+                embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
+
+        return ceLoss,sslLoss
 
     def predict(self, adj, drugs, genes):
-        embeds = self.forward(adj, 1.0)
+        embeds,_,_ = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
         # Select drug and gene embeddings based on input indices
