@@ -82,10 +82,17 @@ class Coach:
         # iteration级别的统计（存储每个iteration的平均值）
         self.iteration_two_hop_stats = []
         
-        # 新增：构建基因邻接关系用于二跳邻居查找,只需要执行一次
-        print("Building gene-gene adjacency matrix for two-hop neighbors...")
-        self.build_gene_adjacency_matrix()
-        print("Gene adjacency matrix built successfully!")
+        # 新增：从预处理缓存加载基因邻接关系用于二跳邻居查找
+        print("Loading gene-gene adjacency matrix from preprocessed cache...")
+        drug_gene_dict, gene_neighbors = load_drug_gene_dict()
+        if gene_neighbors is not None:
+            self.gene_neighbors = gene_neighbors
+            print(f"✅ Gene adjacency matrix loaded from cache: {len(gene_neighbors)} genes")
+        else:
+            raise RuntimeError(
+                f"❌ Failed to load gene_neighbors cache for {args.data}!\n"
+                f"Please run: python preprocess_drug_gene_dict.py --data {args.data}"
+            )
         
         # 设置混合困难负样本缓存文件路径
         cache_dir = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/cache"
@@ -730,39 +737,41 @@ class Coach:
         
         return selected_negatives, weights, situation_type
 
-    def build_gene_adjacency_matrix(self):
-        """
-        构建基因-基因邻接矩阵 一跳邻居
-        基于药物-基因交互关系：如果两个基因都与同一个药物有交互，则认为它们间接相关
-        """
-        # 获取药物-基因交互矩阵 (稀疏矩阵格式)
-        drug_gene_matrix = self.handler.trnLoader.dataset.dokmat
-        
-        # 构建基因-基因邻接字典
-        self.gene_neighbors = {}
-        
-        # 初始化每个基因的邻居集合
-        for gene in range(args.gene):
-            self.gene_neighbors[gene] = set()
-        
-        # 遍历所有药物，找到与每个药物交互的基因
-        drug_gene_dict = {}
-        for (drug, gene) in drug_gene_matrix.keys():
-            if drug not in drug_gene_dict:
-                drug_gene_dict[drug] = set()
-            drug_gene_dict[drug].add(gene)
-        
-        # 基于药物构建基因间的邻接关系
-        for drug, genes in drug_gene_dict.items():
-            genes_list = list(genes)
-            # 对于每对基因，如果它们与同一药物交互，则它们是邻居
-            for i in range(len(genes_list)):
-                for j in range(i + 1, len(genes_list)):
-                    gene1, gene2 = genes_list[i], genes_list[j]
-                    self.gene_neighbors[gene1].add(gene2)
-                    self.gene_neighbors[gene2].add(gene1)
-        
-        print(f"Gene adjacency built: {len(self.gene_neighbors)} genes")
+    # def build_gene_adjacency_matrix(self):
+    #     """
+    #     构建基因-基因邻接矩阵 一跳邻居
+    #     基于药物-基因交互关系：如果两个基因都与同一个药物有交互，则认为它们间接相关
+    #     
+    #     已弃用：改为从预处理缓存加载gene_neighbors
+    #     """
+    #     # 获取药物-基因交互矩阵 (稀疏矩阵格式)
+    #     drug_gene_matrix = self.handler.trnLoader.dataset.dokmat
+    #     
+    #     # 构建基因-基因邻接字典
+    #     self.gene_neighbors = {}
+    #     
+    #     # 初始化每个基因的邻居集合
+    #     for gene in range(args.gene):
+    #         self.gene_neighbors[gene] = set()
+    #     
+    #     # 遍历所有药物，找到与每个药物交互的基因
+    #     drug_gene_dict = {}
+    #     for (drug, gene) in drug_gene_matrix.keys():
+    #         if drug not in drug_gene_dict:
+    #             drug_gene_dict[drug] = set()
+    #         drug_gene_dict[drug].add(gene)
+    #     
+    #     # 基于药物构建基因间的邻接关系
+    #     for drug, genes in drug_gene_dict.items():
+    #         genes_list = list(genes)
+    #         # 对于每对基因，如果它们与同一药物交互，则它们是邻居
+    #         for i in range(len(genes_list)):
+    #             for j in range(i + 1, len(genes_list)):
+    #                 gene1, gene2 = genes_list[i], genes_list[j]
+    #                 self.gene_neighbors[gene1].add(gene2)
+    #                 self.gene_neighbors[gene2].add(gene1)
+    #     
+    #     print(f"Gene adjacency built: {len(self.gene_neighbors)} genes")
         
     def get_mixed_hard_negatives(self, drugs_batch, genes_batch, num_neighbors=None, current_epoch=None, batch_idx=None):
         """
