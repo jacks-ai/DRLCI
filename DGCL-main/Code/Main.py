@@ -24,6 +24,7 @@ from copy import deepcopy
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+from datetime import datetime
 
 
 # Function to set random seed for reproducibility
@@ -1459,6 +1460,71 @@ if __name__ == '__main__':
             print(f"  Iteration {i+1}: 情况1={stats['enough_filtered']:.1f}%, 情况2={stats['some_filtered']:.1f}%, 情况3={stats['enough_random']:.1f}%, 情况4={stats['few_random']:.1f}%")
     else:
         print("⚠️ No valid iteration statistics available")
+
+    # 保存实验结果到log文件
+    def save_results_to_log(overall_iteration_best, coach):
+        """
+        将实验结果保存到log文件
+        文件名格式: MMDD_HHMM_DatasetName.txt
+        文件路径: log目录下
+        """
+        now = datetime.now()
+        log_filename = now.strftime("%m%d_%H%M") + f"_{args.data}.txt"
+        log_dir = os.path.join(os.path.dirname(__file__), '..', 'log')
+        
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        log_filepath = os.path.join(log_dir, log_filename)
+        
+        with open(log_filepath, 'w', encoding='utf-8') as f:
+            f.write("="*60 + "\n")
+            f.write("实验结果记录\n")
+            f.write("="*60 + "\n")
+            f.write(f"数据集: {args.data}\n")
+            f.write(f"时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n")
+            
+            f.write("="*60 + "\n")
+            f.write("超参数配置\n")
+            f.write("="*60 + "\n")
+            f.write(f"学习率 (lr): {args.lr}\n")
+            f.write(f"全局负样本数量 (num_neg): {args.num_neg}\n")
+            f.write(f"二跳邻居数量 (num_two_hop): {args.num_two_hop}\n")
+            f.write(f"一跳最大比例 (one_hop_max_ratio): {args.one_hop_max_ratio:.1%} ({int(args.num_two_hop * args.one_hop_max_ratio)} max samples)\n")
+            f.write(f"一跳权重倍数 (one_hop_weight): {args.one_hop_weight}\n")
+            f.write(f"二跳权重倍数 (two_hop_weight): {args.two_hop_weight}\n")
+            f.write(f"普通负样本权重 (common_neg_weight): {args.common_neg_weight}\n")
+            f.write("\n")
+            
+            f.write("="*60 + "\n")
+            f.write("评估指标结果\n")
+            f.write("="*60 + "\n")
+            f.write("\n")
+            
+            for metric, values in overall_iteration_best.items():
+                valid_vals = [val for val in values if not np.isnan(val)]
+                if len(valid_vals) == 0:
+                    f.write(f"{metric}:\n")
+                    f.write(f"  平均最佳: N/A\n")
+                    f.write(f"  最高最佳: N/A\n")
+                    f.write(f"  所有迭代最佳值: []\n")
+                else:
+                    avg_best = np.mean(valid_vals)
+                    max_best = np.max(valid_vals)
+                    rounded_vals = [round(val, 4) for val in valid_vals]
+                    f.write(f"{metric}:\n")
+                    f.write(f"  平均最佳 = {avg_best:.4f}\n")
+                    f.write(f"  最高最佳 = {max_best:.4f}\n")
+                    f.write(f"  所有迭代最佳值 = {rounded_vals}\n")
+                f.write("\n")
+            
+            f.write("="*60 + "\n")
+        
+        print(f"✅ 实验结果已保存到: {log_filepath}")
+        return log_filepath
+    
+    save_results_to_log(overall_iteration_best, coach)
 
     # results_parent_path = "D:\\桌面\\研\\论文\\实验代码\\DGCL-main\\DGCL-main\\results"
     # # results_parent_path = os.path.join(wandb.run.dir, 'results')
