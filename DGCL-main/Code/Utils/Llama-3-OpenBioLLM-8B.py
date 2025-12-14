@@ -5,11 +5,13 @@ from huggingface_hub.constants import default_cache_path
 # 使用这种官方给的下载方式AutoModelForCausalLM一直下不动
 # 用snapshot_download 反而可以下载了（只下载不加载，这样就对显存没要求
 # 把之前下载的清空一下，下载变快了
+# 这个进度条不靠谱，不能看，看blobs中文件有没有更新，以及任务管理器中的磁盘读取速度
+# 下载的话以这个文件为准，直接一个force_download = True,就回归正常下载了，不要用那个AI写的傻逼脚本
 
 model_id = "aaditya/Llama3-OpenBioLLM-8B"
 # F:\my_models\Llama3-OpenBioLLM-8B
 cache_dir = r"F:\my_models\Llama3-OpenBioLLM-8B"
-
+# 如果目录已经存在，也不要报错
 os.makedirs(cache_dir, exist_ok=True)
 
 print("=" * 80)
@@ -48,7 +50,8 @@ try:
     repo_path = snapshot_download(
         repo_id=model_id,
         cache_dir=cache_dir,
-        local_files_only=False
+        local_files_only=False,
+        force_download = False  # 强制重新下载,不要缓存
     )
     
     print(f"✓ 模型下载完成")
