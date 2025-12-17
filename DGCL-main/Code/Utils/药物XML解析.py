@@ -228,7 +228,7 @@ def parse_drugbank_ultimate_fallback(xml_file_path):
 
 # ⚠️ 请确认路径
 xml_path = r"D:\桌面\研\drugbank\full database.xml"
-output_csv = r"D:\桌面\研\论文\实验代码\DGCL-main\DGCL-main\Code\Utils\drugbank_llm_features_v2.csv"
+output_csv = r"D:\桌面\研\论文\实验代码\DGCL-main\DGCL-main\Code\Utils\drugbank_llm_features.csv"
 
 # 1. 运行解析
 try:

@@ -12,10 +12,10 @@ def extract_and_save_drug_texts(base_path):
         base_path (str): 服务器上的项目根目录路径。
     """
     # 1. 定义文件路径
-    train_csv_path = "/mnt/data/huangpeng/DGCL/DGCL-main/Data/DrugBank/transductive/train.csv"
+    train_csv_path = "/mnt/data/huangpeng/DGCL/DGCL-main/Data/DrugBank/transductive/test.csv"
     features_csv_path = os.path.join(base_path, 'drugbank_llm_features.csv')
     # output_dir = os.path.join(base_path, 'Data/DrugBank/drug_text_train')
-    output_json_path = os.path.join(base_path, 'drug_text_train.json')
+    output_json_path = os.path.join(base_path, 'drug_text_test.json')
 
     print(f"源文件 (train): {train_csv_path}")
     print(f"特征文件: {features_csv_path}")
@@ -75,5 +75,5 @@ def extract_and_save_drug_texts(base_path):
 
 if __name__ == '__main__':
     # ⚠️ 请确保这个路径是您在服务器上的项目根目录
-    server_base_path = '/mnt/data/huangpeng/DGCL/DGCL-main/Data/DrugBank/drug_text_train'
+    server_base_path = '/mnt/data/huangpeng/DGCL/DGCL-main/Data/DrugBank/drug_text_test'
     extract_and_save_drug_texts(server_base_path)
