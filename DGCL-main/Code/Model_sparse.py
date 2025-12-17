@@ -185,9 +185,25 @@ class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
 
-        # 初始化药物和基因的嵌入向量
-        self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))
-        self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
+        # 加载预训练的嵌入
+        # 注意：这里的路径需要通过args传入。请确保在主训练脚本中添加了 'pretrained_drug_embed_path' 和 'pretrained_gene_embed_path' 参数。
+        pretrained_drug_embeds = t.from_numpy(np.load(args.pretrained_drug_embed_path)).float()
+        pretrained_gene_embeds = t.from_numpy(np.load(args.pretrained_gene_embed_path)).float()
+
+        # 获取预训练嵌入的维度
+        pretrained_dim = pretrained_drug_embeds.shape[1]
+
+        # 定义线性映射层，将预训练维度映射到模型的潜在维度
+        self.drug_embedding_mapper = nn.Linear(pretrained_dim, args.latdim)
+        self.gene_embedding_mapper = nn.Linear(pretrained_dim, args.latdim)
+
+        # 将预训练嵌入作为不可训练的缓冲区，以避免在反向传播中被更新
+        self.register_buffer('pretrained_dEmbeds', pretrained_drug_embeds)
+        self.register_buffer('pretrained_gEmbeds', pretrained_gene_embeds)
+
+        # 旧的随机初始化嵌入已被替换
+        # self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))
+        # self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
 
         # 初始化普通图卷积层
         self.gcnLayer = GCNLayer()
@@ -207,7 +223,11 @@ class Model(nn.Module):
 
     # self.torchBiAdj作为adj输入
     def forward(self, adj, keepRate):
-        embeds = t.cat([self.dEmbeds, self.gEmbeds], axis=0)
+        # 使用映射层处理预训练嵌入，得到符合模型内部维度的特征
+        dEmbeds = self.drug_embedding_mapper(self.pretrained_dEmbeds)
+        gEmbeds = self.gene_embedding_mapper(self.pretrained_gEmbeds)
+
+        embeds = t.cat([dEmbeds, gEmbeds], axis=0)
         embedsLst = [embeds]
         gcnEmbedsLst = [embeds]
         causalEmbedsLst = [embeds]
@@ -397,7 +417,10 @@ class Model(nn.Module):
 
     def getEmbeds(self):
         self.unfreeze(self.gcnLayer)
-        return t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+        # 确保返回的是经过映射层处理后的嵌入
+        dEmbeds = self.drug_embedding_mapper(self.pretrained_dEmbeds)
+        gEmbeds = self.gene_embedding_mapper(self.pretrained_gEmbeds)
+        return t.cat([dEmbeds, gEmbeds], axis=0)
 
     def unfreeze(self, layer):
         for child in layer.children():
