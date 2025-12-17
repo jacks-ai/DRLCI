@@ -1470,6 +1470,7 @@ if __name__ == '__main__':
         """
         now = datetime.now()
         log_filename = now.strftime("%m%d_%H%M") + f"_{args.data}.txt"
+        # 获取当前脚本所在目录路径
         log_dir = os.path.join(os.path.dirname(__file__), '..', 'log')
         
         if not os.path.exists(log_dir):
