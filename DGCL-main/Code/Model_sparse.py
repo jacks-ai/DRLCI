@@ -279,7 +279,9 @@ class Model(nn.Module):
 
     # 用于模型生成药物与基因嵌入
     def forward_gcn(self, adj):
-        iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+        dEmbeds = self.drug_embedding_mapper(self.pretrained_dEmbeds)
+        gEmbeds = self.gene_embedding_mapper(self.pretrained_gEmbeds)
+        iniEmbeds = t.concat([dEmbeds, gEmbeds], axis=0)
 
         embedsLst = [iniEmbeds]
         for i in range(args.gnn_layer):
