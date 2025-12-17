@@ -205,6 +205,7 @@ class Model(nn.Module):
         # 初始化因果图卷积层，用于捕获节点间的因果关系
         self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
 
+    # self.torchBiAdj作为adj输入
     def forward(self, adj, keepRate):
         embeds = t.cat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [embeds]
