@@ -9,7 +9,6 @@ from chembl_webresource_client.new_client import new_client
 mechanism = new_client.mechanism
 molecule = new_client.molecule
 
-
 TRANSDUCTIVE_DIR = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/transductive"
 DRUGBANK_FEATURES_CSV = r"/mnt/data/huangpeng/DGCL/DGCL-main/Data/DrugBank/drug_text/drugbank_llm_features.csv"
 OUTPUT_CSV = "/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/drug_text/mixed_drug_descriptions.csv"
@@ -18,7 +17,6 @@ OUTPUT_CSV = "/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/drug_text/mixed_drug
 def get_pubchem_description_via_api(cid):
     """
     通过 PubChem PUG REST API 获取详细的文本描述
-    这是 pubchempy 库默认不提供的，必须单独请求
     """
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/description/JSON"
     try:
@@ -34,6 +32,23 @@ def get_pubchem_description_via_api(cid):
     except Exception:
         pass
     return ""
+
+
+def get_best_structural_representation(compound):
+    """
+    [新增函数] 获取最佳的结构表示字段，替代复杂的 IUPAC 命名或简单的分子式。
+    优先级：Isomeric SMILES > Canonical SMILES > Molecular Formula
+    """
+    try:
+        if compound.isomeric_smiles:
+            return f"SMILES: {compound.isomeric_smiles}"
+        elif compound.canonical_smiles:
+            return f"SMILES: {compound.canonical_smiles}"
+        elif compound.molecular_formula:
+            return f"Formula: {compound.molecular_formula}"
+    except Exception:
+        pass
+    return "Structure info unavailable."
 
 
 def load_drug_ids_from_transductive(transductive_dir):
@@ -59,7 +74,6 @@ def load_drug_ids_from_transductive(transductive_dir):
 def load_drugbank_llm_text(csv_path, target_ids):
     """
     从预先解析好的 drugbank_llm_features.csv 读取 DrugBank 药物的描述。
-    仅返回 target_ids 对应的内容，key 保持原 ID（不区分大小写）。
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"找不到 DrugBank 描述文件: {csv_path}")
@@ -80,16 +94,14 @@ def load_drugbank_llm_text(csv_path, target_ids):
             missing_ids.append(drug_id)
 
     if missing_ids:
-        raise ValueError(
-            f"DrugBank CSV 中缺少 {len(missing_ids)} 个目标药物ID: {missing_ids[:10]}..."
-        )
+        print(f"⚠️ 警告: DrugBank CSV 中缺少 {len(missing_ids)} 个目标药物ID: {missing_ids[:5]}...")
 
     return descriptions
 
 
 def fetch_drug_info(query_id):
     """
-    智能路由函数：根据 ID 类型自动选择数据源
+    智能路由函数：根据 ID 类型自动选择数据源 (ChEMBL, CID, SID, Name)
     """
     query_id = str(query_id).strip()
 
@@ -109,22 +121,42 @@ def fetch_drug_info(query_id):
             if mech_str:
                 return f"Drug Name: {name}. Mechanism: {mech_str}"
             else:
-                # 如果没有机制，返回名字
                 return f"Drug Name: {name}. Source: ChEMBL."
 
         except Exception as e:
             return f"Drug Name: {query_id}. Error: {str(e)}"
 
-    # === 2. 处理 PubChem CID (纯数字) 或 药物名称 ===
+    # === 2. 处理 PubChem CID / SID / Name ===
     else:
         cid = None
         input_name = query_id
+        is_sid = False
 
         try:
-            # A. 如果是纯数字，直接作为 CID
+            # A. 尝试处理纯数字 ID (可能是 CID 也可能是 SID)
             if query_id.isdigit():
-                cid = int(query_id)
-            # B. 如果是名称 (如 XL-765)，先搜索 CID
+                input_id = int(query_id)
+
+                try:
+                    # 尝试作为 CID 获取化合物对象
+                    c = pcp.Compound.from_cid(input_id)
+                    _ = c.molecular_formula  # 触发请求验证
+                    cid = input_id
+                except (pcp.BadRequestError, pcp.NotFoundError, pcp.PubChemHTTPError):
+                    # 如果作为 CID 失败，尝试作为 SID (Substance ID)
+                    try:
+                        print(f"   -> ID {input_id} 不是 CID，尝试作为 SID 查询...")
+                        s = pcp.Substance.from_sid(input_id)
+                        if s.standardized_cid:
+                            cid = s.standardized_cid
+                            is_sid = True
+                            print(f"   -> 映射成功: SID {input_id} -> CID {cid}")
+                        else:
+                            return f"Drug Name: SID {input_id}. Info: No mapped CID found in PubChem."
+                    except Exception:
+                        return f"Drug Name: {input_id}. Info: Not found as CID or SID."
+
+            # B. 处理药物名称 (如 XL-765)
             else:
                 compounds = pcp.get_compounds(query_id, 'name')
                 if compounds:
@@ -133,22 +165,26 @@ def fetch_drug_info(query_id):
                 else:
                     return f"Drug Name: {query_id}. Info: Not found in PubChem."
 
-            # C. 利用 CID 获取详细信息
+            # C. 利用 CID 提取信息
             if cid:
-                # 1. 获取基本属性
                 c = pcp.Compound.from_cid(cid)
                 name = c.synonyms[0] if c.synonyms else input_name
 
-                # 2. [关键步骤] 获取详细文本描述 (Description)
+                # 1. 获取文本描述 (优先)
                 desc_text = get_pubchem_description_via_api(cid)
 
-                # 3. 构造文本
                 parts = [f"Drug Name: {name}."]
+                if is_sid:
+                    parts.append(f"(Derived from SID {query_id})")
+
                 if desc_text:
+                    # 如果有详细描述，直接使用
                     parts.append(f"Description: {desc_text}")
                 else:
-                    # 如果没有描述，用分子式兜底
-                    parts.append(f"Formula: {c.molecular_formula}.")
+                    # [重点修改] 如果没有描述，使用 SMILES 代替 Formula
+                    # 这就是替代复杂 IUPAC 名字的最佳字段
+                    struct_info = get_best_structural_representation(c)
+                    parts.append(struct_info)
 
                 return " ".join(parts)
 
@@ -162,10 +198,14 @@ def main():
 
     db_ids = [drug_id for drug_id in drug_ids if drug_id.upper().startswith("DB")]
     drugbank_texts = {}
+
     if db_ids:
         print(f"🔍 正在从 DrugBank CSV 读取 {len(db_ids)} 个 DB 开头的药物描述...")
-        drugbank_texts = load_drugbank_llm_text(DRUGBANK_FEATURES_CSV, db_ids)
-        print(f"✅ 成功读取 {len(drugbank_texts)} 个 DrugBank 药物描述")
+        try:
+            drugbank_texts = load_drugbank_llm_text(DRUGBANK_FEATURES_CSV, db_ids)
+            print(f"✅ 成功读取 {len(drugbank_texts)} 个 DrugBank 药物描述")
+        except Exception as e:
+            print(f"⚠️ 读取 DrugBank CSV 失败: {e}")
 
     results = []
     missing_ids = set()
@@ -173,6 +213,7 @@ def main():
     print("🚀 开始混合爬取药物描述...\n")
     for did in drug_ids:
         print(f"处理: {did} ...")
+
         if did.upper().startswith("DB"):
             text = drugbank_texts.get(did, "")
             if not text:
@@ -182,8 +223,10 @@ def main():
             text = fetch_drug_info(did)
             if not text or "Not found" in text or "Error" in text:
                 missing_ids.add(did)
+
         results.append({'ID': did, 'LLM_Text': text})
-        print(f" -> {text[:200]}...")
+
+        print(f" -> {text[:150]}...")
         print("-" * 30)
         time.sleep(1)
 
@@ -192,8 +235,7 @@ def main():
     print(f"\n✅ 所有数据已保存至 {OUTPUT_CSV}")
 
     if missing_ids:
-        print(f"⚠️ 共 {len(missing_ids)} 个药物未能获取有效描述:")
-        print(missing_ids)
+        print(f"⚠️ 共 {len(missing_ids)} 个药物未能获取有效描述 (请检查 mixed_drug_descriptions.csv).")
     else:
         print("🎉 所有药物均获取到描述信息")
 
