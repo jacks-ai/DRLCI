@@ -40,27 +40,25 @@ class Model(nn.Module):
             self.drug_proj = nn.Linear(drug_original_dim, args.latdim)
             self.gene_proj = nn.Linear(gene_original_dim, args.latdim)
 
-            # 将原始嵌入通过投射层
-            drug_embeds_projected = self.drug_proj(drug_embeds_train_original)
-            gene_embeds_projected = self.gene_proj(gene_embeds_train_original)
-
             # 初始化投射层的权重
             nn.init.xavier_uniform_(self.drug_proj.weight)
             nn.init.xavier_uniform_(self.gene_proj.weight)
 
-            # L2 Normalize the projected embeddings to control their magnitude  L2归一化
-            normalized_dEmbeds = F.normalize(drug_embeds_projected, p=2, dim=1)
-            normalized_gEmbeds = F.normalize(gene_embeds_projected, p=2, dim=1)
+            # 将原始嵌入通过投射层
+            drug_embeds_projected = self.drug_proj(drug_embeds_train_original)
+            gene_embeds_projected = self.gene_proj(gene_embeds_train_original)
 
-            self.dEmbeds = nn.Parameter(normalized_dEmbeds)
-            self.gEmbeds = nn.Parameter(normalized_gEmbeds)
+            # L2 Normalize the projected embeddings to control their magnitude  L2归一化 没有这里会直接NAN
+            drug_embeds_projected = F.normalize(drug_embeds_projected, p=2, dim=1)
+            gene_embeds_projected = F.normalize(gene_embeds_projected, p=2, dim=1)
+
+            self.dEmbeds = nn.Parameter(drug_embeds_projected)
+            self.gEmbeds = nn.Parameter(gene_embeds_projected)
             print("Pretrained embeddings loaded, projected, and normalized successfully.")
         else:
             print("随机初始化，Initializing drug and gene embeddings randomly.")
             self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))
             self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
-
-
 
         # Initialize GCN (Graph Convolutional Network) layer
         self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
@@ -133,7 +131,7 @@ class Model(nn.Module):
     def getGCN(self):
         return self.gcnLayers
 
-#Define the GCN (Graph Convolutional Network) layer 这里不要有LayerNorm层归一化，会导致NAN
+# Define the GCN (Graph Convolutional Network) layer 这里不要有LayerNorm层归一化，会导致NAN
 class GCNLayer(nn.Module):
     def __init__(self):
         super(GCNLayer, self).__init__()
@@ -166,6 +164,7 @@ class SpAdjDropEdge(nn.Module):
         mask = ((t.rand(edgeNum) + keepRate).floor()).type(t.bool)
         newVals = vals[mask] / keepRate
         newIdxs = idxs[:, mask]
+        # return t.SparseTensor(newIdxs, newVals, adj.shape)
         return t.sparse_coo_tensor(newIdxs, newVals, adj.shape)
 
 
@@ -181,5 +180,5 @@ class ClassifierLayer(nn.Module):
         embeds = F.relu(self.lin1(embeds))
         embeds = F.dropout(embeds, p=0.4, training=self.training)
         ret = self.lin2(embeds)
-        # Clamp the final scores to a safe range before they enter the loss function
-        return t.clamp(ret, min=-10.0, max=10.0)
+        # return t.clamp(ret, min=-10.0, max=10.0)
+        return ret
