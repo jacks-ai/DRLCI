@@ -7,7 +7,7 @@ def ParseArgs():
     parser.add_argument('--batch', default=4096, type=int, help='batch size')
     parser.add_argument('--tstBat', default=100000, type=int, help='number of interactions in a testing batch')
     parser.add_argument('--reg', default=1e-7, type=float, help='weight decay regularizer 权重衰减正则化')
-    parser.add_argument('--epoch', default=300, type=int, help='number of epochs')
+    parser.add_argument('--epoch', default=500, type=int, help='number of epochs')
     parser.add_argument('--latdim', default=128, type=int, help='embedding size')
     parser.add_argument('--hyperNum', default=128, type=int, help='number of hyperedges')
     parser.add_argument('--gnn_layer', default=4, type=int, help='number of gnn layers')
@@ -22,7 +22,7 @@ def ParseArgs():
     parser.add_argument('--multi_gpu', action='store_true', default=False, help='use dual GPUs for parallel computation')
     parser.add_argument('--gpu_list', type=str, default='1', help='list of GPUs to use, separated by comma')
     parser.add_argument('--seed', default=43, type=int, help='seed')
-    parser.add_argument('--iteration', type=int, default='5', help='iteration')
+    parser.add_argument('--iteration', type=int, default='1', help='iteration')
     parser.add_argument('--is_debug', type=bool, default=False, help='is_debug')
     parser.add_argument('--dense', action='store_true', default=False, help='dense')
     parser.add_argument('--validate', action='store_true', default=False,
@@ -34,8 +34,8 @@ def ParseArgs():
     parser.add_argument('--num_two_hop', type=int, default=30, help='每个基因选择的二跳邻居数量')
     parser.add_argument('--one_hop_max_ratio', type=float, default=0.1, help='一跳邻居在困难负样本中的最大比例')
 
-    parser.add_argument('--one_hop_weight', type=float, default=2.0, help='一跳困难负样本权重倍数')
-    parser.add_argument('--two_hop_weight', type=float, default=1.2, help='二跳困难负样本权重倍数')
+    parser.add_argument('--one_hop_weight', type=float, default=0.3, help='一跳困难负样本权重倍数')
+    parser.add_argument('--two_hop_weight', type=float, default=0.2, help='二跳困难负样本权重倍数')
     parser.add_argument('--common_neg_weight', type=float, default=0.4, help='二跳困难负样本权重倍数')
 
     parser.add_argument('--clip_grad_norm', type=float, default=5.0, help='梯度裁剪的最大范数')
@@ -43,6 +43,10 @@ def ParseArgs():
     parser.add_argument('--score_clamp_max', type=float, default=10.0, help='分数裁剪的最大值，防止exp爆炸')
     parser.add_argument('--epsilon', type=float, default=1e-8, help='数值稳定性的小值，防止除零和log(0)')
 
+    parser.add_argument('--pretrained_drug_embed_path', type=str, default="/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/drug_text/dgidb_emd.npy", help='')
+    parser.add_argument('--pretrained_gene_embed_path', type=str, default="/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/gene_text/dgidb_gene_emd.npy", help='')
+    parser.add_argument('--use_llm_embeddings', type=lambda v: str(v).lower() in {'1', 'true', 'yes'}, default=True,
+                        help='是否启用预训练大模型嵌入；False 时改为随机初始化')
     return parser.parse_args()
 
 
