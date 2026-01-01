@@ -60,6 +60,8 @@ class Model(nn.Module):
             self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))
             self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))
 
+
+
         # Initialize GCN (Graph Convolutional Network) layer
         self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
 
@@ -71,21 +73,25 @@ class Model(nn.Module):
     def forward(self, adj, keepRate):
         # Concatenate drug and gene embeddings
         embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
-
-        # Sequentially apply GCN layers, using the output of the previous layer as input for the next
+        embedsLst = [embeds]
+        gcnEmbedsLst = [embeds]
+        # hyperEmbedsLst = [embeds]
         for gcn in self.gcnLayers:
-            embeds = gcn(self.edgeDropper(adj, keepRate), embeds)
+            embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
 
-        # Use the output of the final GCN layer as the definitive embedding
-        # The summation of all layers is removed as it causes numerical instability
-        return embeds, None
+            gcnEmbedsLst.append(embeds)
+            embedsLst.append(embeds)
+        # Sum all embeddings.必须要有这么一步sum操作
+        embeds = sum(embedsLst)
+        return embeds, gcnEmbedsLst
     def forward_gcn(self, adj):
-        embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
+        iniEmbeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
+        embedsLst = [iniEmbeds]
         for gcn in self.gcnLayers:
-            embeds = gcn(adj, embeds)
-
-        mainEmbeds = embeds # 移除了不稳定的残差连接求和操作，改为使用最后一层 GCN 的输出,这里使用sum的话普通负采样都用不了
+            embeds = gcn(adj, embedsLst[-1])
+            embedsLst.append(embeds)
+        mainEmbeds = sum(embedsLst)
 
         return mainEmbeds[:args.drug], mainEmbeds[args.drug:]
 
@@ -103,8 +109,6 @@ class Model(nn.Module):
 
         # Calculate Self-Supervised Learning (SSL) loss
         sslLoss = 0
-
-
         return ceLoss, sslLoss
     def predict(self, adj, drugs, genes):
         embeds, _ = self.forward(adj, 1.0)
@@ -129,21 +133,15 @@ class Model(nn.Module):
     def getGCN(self):
         return self.gcnLayers
 
-#Define the GCN (Graph Convolutional Network) layer
+#Define the GCN (Graph Convolutional Network) layer 这里不要有LayerNorm层归一化，会导致NAN
 class GCNLayer(nn.Module):
     def __init__(self):
         super(GCNLayer, self).__init__()
-        self.layer_norm = nn.LayerNorm(args.latdim)
-
     def forward(self, adj, embeds, flag=True):
         if (flag):
-            embeds = t.spmm(adj, embeds)
+            return t.spmm(adj, embeds)
         else:
-            embeds = torch_sparse.spmm(adj.indices(), adj.values(), adj.shape[0], adj.shape[1], embeds)
-        # Apply layer normalization for training stability  层归一化
-        embeds = self.layer_norm(embeds)
-        return embeds
-
+            return torch_sparse.spmm(adj.indices(), adj.values(), adj.shape[0], adj.shape[1], embeds)
 
 # Define the GCN (Graph Convolutional Network) layer
 # class GCNLayer(nn.Module):
