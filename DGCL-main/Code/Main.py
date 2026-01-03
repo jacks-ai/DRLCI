@@ -1129,11 +1129,35 @@ class Coach:
 
                 # 计算加权BPR损失
                 scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
-                hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
+                hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
 
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
-                neg_loss_value = -(scoreDiff2).sigmoid().log().sum() / args.batch
+                neg_loss_value = -F.logsigmoid(scoreDiff2).sum() / args.batch
+
+                if not t.isfinite(hard_loss_value):
+                    warn_msg = (
+                        f"困难负采样NAN [Warn] Epoch {current_epoch} batch {i}: "
+                        f"non-finite hard loss detected ({hard_loss_value.item()}). "
+                        f"Forcing hard_loss_value=0."
+                    )
+                    print(warn_msg)
+                    if self.log_file:
+                        self.log_file.write(warn_msg + '\n')
+                    hard_loss_value = hard_loss_value.new_tensor(0.0)
+                    continue
+
+                if not t.isfinite(neg_loss_value):
+                    warn_msg = (
+                        f"普通负采样NAN,[Warn] Epoch {current_epoch} batch {i}: "
+                        f"non-finite common neg loss detected ({neg_loss_value.item()}). "
+                        f"Forcing neg_loss_value=0."
+                    )
+                    print(warn_msg)
+                    if self.log_file:
+                        self.log_file.write(warn_msg + '\n')
+                    neg_loss_value = neg_loss_value.new_tensor(0.0)
+                    continue
 
                 # bpr_loss_value = hard_loss_value
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
@@ -1178,8 +1202,8 @@ class Coach:
             ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
             sslLoss_reg = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
-            loss = ceLoss + regLoss
-            # loss = ceLoss + regLoss + sslLoss_reg
+            # loss = ceLoss + regLoss
+            loss = ceLoss + regLoss + sslLoss_reg
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
