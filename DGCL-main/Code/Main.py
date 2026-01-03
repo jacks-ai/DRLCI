@@ -1076,7 +1076,17 @@ class Coach:
             )
             mixed_hard_negatives = mixed_hard_negatives.cuda()
             neg_weights = neg_weights.cuda()
-            mixed_hard_neg_embeds = itmEmbeds[mixed_hard_negatives]  # [batch_size, num_two_hop, 128]
+
+            if mixed_hard_negatives.numel() == 0 or mixed_hard_negatives.size(1) == 0:
+                if current_epoch is not None:
+                    warn_msg = f"跳过困难负采样，[Warn] Epoch {current_epoch} batch {i}: no hard negatives returned, skip hard loss."
+                    print(warn_msg)
+                    if self.log_file:
+                        self.log_file.write(warn_msg + '\n')
+                hard_loss_value = t.tensor(0.0, device=drugEmbeds.device)
+                mixed_hard_neg_embeds = None
+            else:
+                mixed_hard_neg_embeds = itmEmbeds[mixed_hard_negatives]  # [batch_size, num_two_hop, 128]
 
             if current_epoch == 0 and i == 0:
                 print(f"Mixed hard negatives shape: {mixed_hard_neg_embeds.shape}")
@@ -1101,6 +1111,9 @@ class Coach:
             if hasattr(args, 'num_two_hop') and args.num_two_hop > 0:
                 if current_epoch == 0 and i == 0:
                     print("Computing weighted BPR loss with mixed hard negatives...")
+                if mixed_hard_neg_embeds is None:
+                    hard_loss += hard_loss_value
+                    continue
                 # 计算正样本分数
                 posScores = innerProduct(drugEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
 
@@ -1333,7 +1346,7 @@ if __name__ == '__main__':
 
     logger.saveDefault = True
 
-    log_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'log'))
+    log_dir = os.path.normpath(args.log_dir)
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%m%d_%H%M")
     log_filename = f"{timestamp}_{args.data}.txt"
@@ -1385,7 +1398,7 @@ if __name__ == '__main__':
 
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
-        seed = args.seed + i
+        seed = args.seed
         config['seed'] = seed
         config['iteration'] = i + 1
         set_seed(seed)
