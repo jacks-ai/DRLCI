@@ -156,16 +156,16 @@ class Coach:
         epoch_list = []
         acc_list = []
 
-        best_metrics = {met: {'value': float('-inf'), 'epoch': -1} for met in self.metrics_to_track}
+        self.best_metrics = {met: {'value': float('-inf'), 'epoch': -1} for met in self.metrics_to_track}
 
         def update_best_metrics(result_dict, epoch_idx):
             for metric in self.metrics_to_track:
                 metric_value = result_dict.get(metric)
                 if metric_value is None or np.isnan(metric_value):
                     continue
-                if metric_value > best_metrics[metric]['value']:
-                    best_metrics[metric]['value'] = metric_value
-                    best_metrics[metric]['epoch'] = epoch_idx
+                if metric_value > self.best_metrics[metric]['value']:
+                    self.best_metrics[metric]['value'] = metric_value
+                    self.best_metrics[metric]['epoch'] = epoch_idx
 
         aucMax = 0
         bestEpoch = 0
@@ -187,11 +187,15 @@ class Coach:
                 if bestEpoch > 0:
                     output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. Best epoch so far: {bestEpoch}, ACC: {round(aucMax, 4)}'
                     print(output_str)
+                    if self.log_file:
+                        self.log_file.write(output_str + '\n')
                     # 返回当前最佳结果，继续下一个iteration
                     return aucMax, output_str, aucMax, nan_metrics
                 else:
                     output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                     print(output_str)
+                    if self.log_file:
+                        self.log_file.write(output_str + '\n')
                     print("➡️ Continuing to next iteration...")
                     # 没有有效结果，返回NAN，但继续下一个iteration
                     return float('nan'), output_str, float('nan'), nan_metrics
@@ -212,11 +216,15 @@ class Coach:
                     if bestEpoch > 0:
                         output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. Best epoch so far: {bestEpoch}, ACC: {round(aucMax, 4)}'
                         print(output_str)
+                        if self.log_file:
+                            self.log_file.write(output_str + '\n')
                         # 返回当前最佳结果，继续下一个iteration
                         return aucMax, output_str, aucMax, nan_metrics
                     else:
                         output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                         print(output_str)
+                        if self.log_file:
+                            self.log_file.write(output_str + '\n')
                         print("➡️ Continuing to next iteration...")
                         # 没有有效结果，返回NAN，但继续下一个iteration
                         return float('nan'), output_str, float('nan'), nan_metrics
@@ -275,9 +283,9 @@ class Coach:
 
         # 每轮itration结束补充输出一个最好的结果
         best_lines = []
-        acc_best_epoch = best_metrics['Acc']['epoch']
+        acc_best_epoch = self.best_metrics['Acc']['epoch']
         if acc_best_epoch != -1:
-            aucMax = best_metrics['Acc']['value']
+            aucMax = self.best_metrics['Acc']['value']
             bestEpoch = acc_best_epoch
         else:
             aucMax = float('nan')
@@ -288,8 +296,8 @@ class Coach:
         for metric in self.metrics_to_track:
             if metric == 'Acc':
                 continue
-            best_value = best_metrics[metric]['value']
-            best_epoch = best_metrics[metric]['epoch']
+            best_value = self.best_metrics[metric]['value']
+            best_epoch = self.best_metrics[metric]['epoch']
             if best_epoch == -1:
                 best_lines.append(f'Best epoch for {metric} : N/A , {metric} : N/A')
             else:
@@ -303,7 +311,7 @@ class Coach:
             self.log_file.write(log_text + '\n')
 
         iteration_best_metrics = {
-            metric: (best_metrics[metric]['value'] if best_metrics[metric]['epoch'] != -1 else float('nan'))
+            metric: (self.best_metrics[metric]['value'] if self.best_metrics[metric]['epoch'] != -1 else float('nan'))
             for metric in self.metrics_to_track
         }
 
@@ -312,6 +320,12 @@ class Coach:
     # Function to prepare the model and optimizer
     def prepareModel(self):
         self.model = Model().cuda()
+        mode_msg = "模型模式：启用LLM文本嵌入 + 结构特征 (MoE)" if getattr(self.model, 'use_text_features', False) \
+            else "模型模式：仅使用结构嵌入"
+        print(mode_msg)
+        log(mode_msg)
+        if self.log_file:
+            self.log_file.write(mode_msg + '\n')
         self.is_data_parallel = False
 
         # 如果启用多GPU并且有多个GPU可用，使用DataParallel
@@ -1125,8 +1139,8 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                # total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
-                total_loss = neg_loss_value * args.common_neg_weight + regLoss
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
                 total_loss.backward()
@@ -1166,7 +1180,13 @@ class Coach:
             # 使用优化算法（例如 SGD、Adam、RMSprop 等）来更新模型参数
             self.opt.step()
             # bprLoss = 0
-            regLoss = 0
+
+            # 记录损失
+            # bpr_loss += float(bpr_loss_value)
+            hard_loss += hard_loss_value
+            common_loss += neg_loss_value
+            reg_loss += float(regLoss)
+
         ret = dict()
         ret['Loss'] = epLoss / steps
         ret['sslLoss'] = sslLoss / steps
@@ -1175,9 +1195,6 @@ class Coach:
         ret['hard_neg_loss'] = hard_loss / steps
         ret['regLoss'] = reg_loss / steps
         return ret
-
-    # Function to test a single epoch
-    # 计算出ACC
     def testEpoch(self):
         self.model.eval()
         tstLoader = self.handler.tstLoader
@@ -1316,10 +1333,10 @@ if __name__ == '__main__':
 
     logger.saveDefault = True
 
-    log_dir = 'Logs'
+    log_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'log'))
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{args.data}_{timestamp}.log"
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+    log_filename = f"{timestamp}_{args.data}.txt"
     log_filepath = os.path.join(log_dir, log_filename)
 
     log_file = open(log_filepath, 'w')
@@ -1364,6 +1381,7 @@ if __name__ == '__main__':
     it_max = 0
     aucMax = 0
     overall_iteration_best = {met: [] for met in coach.metrics_to_track}
+    best_epochs_per_metric = {met: [] for met in coach.metrics_to_track}
 
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
@@ -1389,8 +1407,10 @@ if __name__ == '__main__':
         aucMax_list.append(aucMax)
         outputstr_list.append(output_str)
         for metric in coach.metrics_to_track:
-            metric_value = iteration_best_metrics.get(metric, float('nan'))
-            overall_iteration_best[metric].append(metric_value)
+            best_val = iteration_best_metrics[metric]
+            best_ep = coach.best_metrics[metric]['epoch'] if best_val is not None and not np.isnan(best_val) else -1
+            overall_iteration_best[metric].append(best_val)
+            best_epochs_per_metric[metric].append(best_ep)
 
         # 只有非NAN的aucMax才更新it_max
         if not np.isnan(aucMax) and aucMax > it_max:
@@ -1434,11 +1454,16 @@ if __name__ == '__main__':
         has_valid_metric = True
         avg_best = np.mean(valid_vals)
         max_best = np.max(valid_vals)
-        rounded_vals = [round(val, 4) for val in valid_vals]
+        epochs = best_epochs_per_metric[metric]
+        valid_pairs = [(v, e) for v, e in zip(values, epochs) if not np.isnan(v)]
+        max_best_val, max_best_epoch = max(valid_pairs, key=lambda item: item[0])
+
         summary_log.append(f'  {metric}:')
         summary_log.append(f'    平均最佳 = {avg_best:.4f}')
-        summary_log.append(f'    最高最佳 = {max_best:.4f}')
-        summary_log.append(f'    所有迭代最佳值 = {rounded_vals}')
+        summary_log.append(f'    最高最佳 = {max_best_val:.4f} (at epoch {max_best_epoch})')
+        # 格式化列表输出
+        formatted_values = [f'{v:.4f} (epoch {e})' for v, e in zip(values, epochs)]
+        summary_log.append(f"    所有迭代最佳值 = [{', '.join(formatted_values)}]")
     if not has_valid_metric:
         summary_log.append("❌ All iterations resulted in NAN!")
 
@@ -1484,16 +1509,8 @@ if __name__ == '__main__':
         文件路径: log目录下
         """
         now = datetime.now()
-        log_filename = now.strftime("%m%d_%H%M") + f"_{args.data}.txt"
-        # 获取当前脚本所在目录路径
-        log_dir = os.path.join(os.path.dirname(__file__), '..', 'log')
 
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-
-        log_filepath = os.path.join(log_dir, log_filename)
-
-        with open(log_filepath, 'w', encoding='utf-8') as f:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
             f.write("=" * 60 + "\n")
             f.write("实验结果记录\n")
             f.write("=" * 60 + "\n")
@@ -1512,6 +1529,8 @@ if __name__ == '__main__':
             f.write(f"一跳权重倍数 (one_hop_weight): {args.one_hop_weight}\n")
             f.write(f"二跳权重倍数 (two_hop_weight): {args.two_hop_weight}\n")
             f.write(f"普通负样本权重 (common_neg_weight): {args.common_neg_weight}\n")
+            text_mode = "启用LLM文本嵌入" if args.use_llm_embeddings else "仅使用结构嵌入"
+            f.write(f"文本嵌入模式: {text_mode}\n")
             f.write("\n")
 
             f.write("=" * 60 + "\n")
@@ -1520,26 +1539,30 @@ if __name__ == '__main__':
             f.write("\n")
 
             for metric, values in overall_iteration_best.items():
-                valid_vals = [val for val in values if not np.isnan(val)]
-                if len(valid_vals) == 0:
-                    f.write(f"{metric}:\n")
-                    f.write(f"  平均最佳: N/A\n")
-                    f.write(f"  最高最佳: N/A\n")
-                    f.write(f"  所有迭代最佳值: []\n")
-                else:
-                    avg_best = np.mean(valid_vals)
-                    max_best = np.max(valid_vals)
-                    rounded_vals = [round(val, 4) for val in valid_vals]
-                    f.write(f"{metric}:\n")
-                    f.write(f"  平均最佳 = {avg_best:.4f}\n")
-                    f.write(f"  最高最佳 = {max_best:.4f}\n")
-                    f.write(f"  所有迭代最佳值 = {rounded_vals}\n")
-                f.write("\n")
+                epochs = best_epochs_per_metric[metric]
+                if not values or all(np.isnan(v) for v in values):
+                    f.write(f"\n{metric}:\n  数据不足或全为NAN\n")
+                    continue
 
-            f.write("=" * 60 + "\n")
+                valid_pairs = [(v, e) for v, e in zip(values, epochs) if not np.isnan(v)]
+                
+                if not valid_pairs:
+                    f.write(f"\n{metric}:\n  无有效数据\n")
+                    continue
 
-        print(f"✅ 实验结果已保存到: {log_filepath}")
-        return log_filepath
+                valid_values = [p[0] for p in valid_pairs]
+                mean_best = np.mean(valid_values)
+                max_best_val, max_best_epoch = max(valid_pairs, key=lambda item: item[0])
+
+                f.write(f"\n{metric}:\n")
+                f.write(f"  平均最佳 = {mean_best:.4f}\n")
+                f.write(f"  最高最佳 = {max_best_val:.4f} (在 epoch {max_best_epoch})\n")
+                # 格式化列表输出，将值和epoch合并
+                formatted_values = [f'{v:.4f} (epoch {e})' for v, e in zip(values, epochs)]
+                f.write(f"  所有迭代最佳值 = [{', '.join(formatted_values)}]\n")
+
+            print(f"✅ 实验结果已保存到: {log_filepath}")
+            return log_filepath
 
 
     save_results_to_log(overall_iteration_best, coach)
