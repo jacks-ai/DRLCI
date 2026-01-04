@@ -142,6 +142,22 @@ class Coach:
         log(self.makePrint('Test', args.epoch, reses, True))
         return reses['Acc']
 
+    def random_sample_nonzero(self, arr_list, k, pad_value=-1):
+        result_list = []
+        for row in arr_list:
+            row_np = np.array(row)
+            valid_indices = np.where(row_np != -1)[0]
+            if len(valid_indices) == 0:
+                result_row = [pad_value] * k
+            elif len(valid_indices) < k:
+                repeats_needed = k // len(valid_indices) + 1
+                repeated_elements = np.tile(row_np[valid_indices], repeats_needed)
+                result_row = repeated_elements[:k].tolist()
+            else:
+                result_row = np.random.choice(row_np[valid_indices], k, replace=False).tolist()
+            result_list.append(result_row)
+        return result_list
+
     # Function to train and evaluate the model
     def run(self, i):
         self.prepareModel()
@@ -174,7 +190,7 @@ class Coach:
 
         for ep in range(stloc, args.epoch):
             tstFlag = (ep % args.tstEpoch == 0)
-            reses = self.trainEpoch(ep)
+            reses = self.trainEpoch(ep, i)
             train_loss = reses
 
             # NAN检测：检查训练结果是否包含NAN
@@ -1032,14 +1048,35 @@ class Coach:
 
     # Function to train a single epoch
     # 返回损失值 更新参数
-    def trainEpoch(self, current_epoch):
+    def trainEpoch(self, current_epoch, iteration_count):
         self.model.train()
         trnLoader = self.handler.trnLoader
         if current_epoch == 0:
             print("开始生成普通负样本")
+            print(iteration_count)
         # 这一步如果在DataHandler中就执行会牺牲随机性
         trnLoader.dataset.positive_genes_dict = self.drug_gene_dict
         trnLoader.dataset.negSampling()  # 这一步非常消耗时间，改多线程生成
+        if (current_epoch == 0 and (iteration_count == 0)):
+            print("make_neg_begin")
+            trnLoader.dataset.negMul_gene()
+            print("make_neg_gene_over")
+            trnLoader.dataset.negMul_drug()
+            print("make_neg_drug_over")
+            trnLoader.dataset.padded_matrix()
+            print("make_neg_over")
+            print(args.num_neg)
+            print(args.num_neg_mul)
+
+        num_neg_mul = getattr(args, 'num_neg_mul', 0)
+        enable_drug_local = (args.data == 'DGIdb') or (getattr(args, 'is_use', 0) != 0)
+
+        def _to_numpy(arr):
+            if isinstance(arr, np.ndarray):
+                return arr
+            if t.is_tensor(arr):
+                return arr.detach().cpu().numpy()
+            return np.asarray(arr)
 
         # 重置epoch级别的二跳邻居统计
         self.epoch_two_hop_stats = {
@@ -1049,17 +1086,21 @@ class Coach:
             'few_random': 0
         }
 
-        hard_loss_sum = 0
         epLoss, epPreLoss = 0, 0
         bprLoss, bpr_loss, reg_loss, regLoss, im_loss = 0, 0, 0, 0, 0
         hard_loss, common_loss = 0, 0
+        loss_mult_loss = 0
 
         # 数据集长度
         len__ = trnLoader.dataset.__len__()
         steps = len__ // args.batch  # 步数=长度/批次数
         for i, tem in enumerate(trnLoader):
             data = deepcopy(self.handler.torchBiAdj).cuda()
-            drugs, genes, labels, negs = tem
+            if len(tem) == 8:
+                drugs, genes, labels, negs, negs_mul_genes_labels, mul_genes, negs_mul_drugs_labels, mul_drugs = tem
+            else:
+                drugs, genes, labels, negs = tem
+                negs_mul_genes_labels = mul_genes = negs_mul_drugs_labels = mul_drugs = None
             drugs = drugs.long().cuda()
             genes = genes.long().cuda()
             labels = labels.long().cuda()
@@ -1069,6 +1110,65 @@ class Coach:
             # 获取正样本和负样本的嵌入
             drugEmbeds = usrEmbeds[drugs]  # 药物嵌入 4096 128
             posEmbeds = itmEmbeds[genes]  # 正样本嵌入 4096 128
+
+            local_negatives_ready = (
+                num_neg_mul != 0 and
+                mul_genes is not None and
+                negs_mul_genes_labels is not None
+            )
+
+            if local_negatives_ready:
+                labels_np = _to_numpy(labels)
+                mul_genes_np = _to_numpy(mul_genes)
+                negs_mul_genes_labels_np = _to_numpy(negs_mul_genes_labels)
+                bool_matrix_gene = (negs_mul_genes_labels_np == labels_np[:, None])
+                inverted_bool_gene = np.logical_not(bool_matrix_gene)
+                negs_mul_genes_list = [
+                    row[mask] for row, mask in zip(mul_genes_np, inverted_bool_gene)
+                ]
+                negs_mul_genes_list = self.random_sample_nonzero(negs_mul_genes_list, num_neg_mul, -1)
+                negs_mul_genes = t.tensor(negs_mul_genes_list, device=drugs.device).long()
+
+                negs_mul_drugs = None
+                if enable_drug_local and mul_drugs is not None and negs_mul_drugs_labels is not None:
+                    mul_drugs_np = _to_numpy(mul_drugs)
+                    negs_mul_drugs_labels_np = _to_numpy(negs_mul_drugs_labels)
+                    bool_matrix_drug = (negs_mul_drugs_labels_np == labels_np[:, None])
+                    inverted_bool_drug = np.logical_not(bool_matrix_drug)
+                    negs_mul_drugs_list = [
+                        row[mask] for row, mask in zip(mul_drugs_np, inverted_bool_drug)
+                    ]
+                    negs_mul_drugs_list = self.random_sample_nonzero(negs_mul_drugs_list, num_neg_mul, -1)
+                    negs_mul_drugs = t.tensor(negs_mul_drugs_list, device=drugs.device).long()
+
+                zero_item = itmEmbeds.new_zeros(1, itmEmbeds.shape[1])
+                itmEmbeds_local = t.cat((itmEmbeds, zero_item), dim=0)
+                sentinel_item_idx = itmEmbeds_local.size(0) - 1
+                negs_mul_genes = negs_mul_genes.clone()
+                negs_mul_genes[negs_mul_genes < 0] = sentinel_item_idx
+                negEmbeds_gene_local = itmEmbeds_local[negs_mul_genes]
+
+                usrEmbeds_local = usrEmbeds
+                negEmbeds_drug_local = None
+                if negs_mul_drugs is not None:
+                    zero_user = usrEmbeds.new_zeros(1, usrEmbeds.shape[1])
+                    usrEmbeds_local = t.cat((usrEmbeds, zero_user), dim=0)
+                    sentinel_usr_idx = usrEmbeds_local.size(0) - 1
+                    negs_mul_drugs = negs_mul_drugs.clone()
+                    negs_mul_drugs[negs_mul_drugs < 0] = sentinel_usr_idx
+                    negEmbeds_drug_local = usrEmbeds_local[negs_mul_drugs]
+
+                ancEmbeds = usrEmbeds[drugs]
+                posScores_local = innerProduct(ancEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))
+                negScores_gene_local = innerProduct(posEmbeds.unsqueeze(1), negEmbeds_gene_local)
+                scoreDiff_local = posScores_local - negScores_gene_local
+                if negEmbeds_drug_local is not None:
+                    negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
+                    scoreDiff_local = scoreDiff_local - negScores_drug_local
+
+                local_bpr_loss = -(scoreDiff_local).sigmoid().log().sum() / args.batch
+                loss_mult_loss += float(local_bpr_loss)
+
             # 获取混合困难负样本和对应权重
             mixed_hard_negatives, neg_weights = self.get_mixed_hard_negatives(
                 drugs.cpu(), genes.cpu(), num_neighbors=args.num_two_hop,
@@ -1077,16 +1177,7 @@ class Coach:
             mixed_hard_negatives = mixed_hard_negatives.cuda()
             neg_weights = neg_weights.cuda()
 
-            if mixed_hard_negatives.numel() == 0 or mixed_hard_negatives.size(1) == 0:
-                if current_epoch is not None:
-                    warn_msg = f"跳过困难负采样，[Warn] Epoch {current_epoch} batch {i}: no hard negatives returned, skip hard loss."
-                    print(warn_msg)
-                    if self.log_file:
-                        self.log_file.write(warn_msg + '\n')
-                hard_loss_value = t.tensor(0.0, device=drugEmbeds.device)
-                mixed_hard_neg_embeds = None
-            else:
-                mixed_hard_neg_embeds = itmEmbeds[mixed_hard_negatives]  # [batch_size, num_two_hop, 128]
+            mixed_hard_neg_embeds = itmEmbeds[mixed_hard_negatives]  # [batch_size, num_two_hop, 128]
 
             if current_epoch == 0 and i == 0:
                 print(f"Mixed hard negatives shape: {mixed_hard_neg_embeds.shape}")
@@ -1111,9 +1202,6 @@ class Coach:
             if hasattr(args, 'num_two_hop') and args.num_two_hop > 0:
                 if current_epoch == 0 and i == 0:
                     print("Computing weighted BPR loss with mixed hard negatives...")
-                if mixed_hard_neg_embeds is None:
-                    hard_loss += hard_loss_value
-                    continue
                 # 计算正样本分数
                 posScores = innerProduct(drugEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))  # [batch_size, 1]
 
@@ -1130,10 +1218,14 @@ class Coach:
                 # 计算加权BPR损失
                 scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
                 hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
+                # hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
+
 
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
-                neg_loss_value = -F.logsigmoid(scoreDiff2).sum() / args.batch
+                # neg_loss_value = -F.logsigmoid(scoreDiff2).sum() / args.batch
+                neg_loss_value = -(scoreDiff2).sigmoid().log().sum() / args.batch
+
 
                 if not t.isfinite(hard_loss_value):
                     warn_msg = (
@@ -1145,7 +1237,7 @@ class Coach:
                     if self.log_file:
                         self.log_file.write(warn_msg + '\n')
                     hard_loss_value = hard_loss_value.new_tensor(0.0)
-                    continue
+
 
                 if not t.isfinite(neg_loss_value):
                     warn_msg = (
@@ -1157,7 +1249,7 @@ class Coach:
                     if self.log_file:
                         self.log_file.write(warn_msg + '\n')
                     neg_loss_value = neg_loss_value.new_tensor(0.0)
-                    continue
+
 
                 # bpr_loss_value = hard_loss_value
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
@@ -1176,7 +1268,7 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
@@ -1198,12 +1290,12 @@ class Coach:
                     print(f"  Total loss: {total_loss:.4f}")
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
+
             # 计算交叉熵损失
             ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
-            sslLoss_reg = sslLoss * args.ssl_reg
             regLoss = calcRegLoss(self.model) * args.reg
             # loss = ceLoss + regLoss
-            loss = ceLoss + regLoss + sslLoss_reg
+            loss = ceLoss + regLoss + sslLoss
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
@@ -1226,11 +1318,13 @@ class Coach:
 
         ret = dict()
         ret['Loss'] = epLoss / steps
-        ret['sslLoss'] = sslLoss / steps
+        # ret['sslLoss'] = sslLoss / steps
         ret['preLoss'] = epPreLoss / steps
         ret['common_neg_loss'] = common_loss / steps
         ret['hard_neg_loss'] = hard_loss / steps
         ret['regLoss'] = reg_loss / steps
+        if num_neg_mul != 0:
+            ret['local_neg_loss'] = loss_mult_loss / steps
         return ret
     def testEpoch(self):
         self.model.eval()
@@ -1372,7 +1466,7 @@ if __name__ == '__main__':
 
     log_dir = os.path.normpath(args.log_dir)
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%m%d_%H%M")
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
     log_filename = f"{timestamp}_{args.data}.txt"
     log_filepath = os.path.join(log_dir, log_filename)
 
