@@ -1105,11 +1105,6 @@ class Coach:
             genes = genes.long().cuda()
             labels = labels.long().cuda()
             negs = negs.long().cuda()
-            # 得到嵌入用于计算负采样损失
-            usrEmbeds, itmEmbeds = self.get_model().forward_gcn(data)
-            # 获取正样本和负样本的嵌入
-            drugEmbeds = usrEmbeds[drugs]  # 药物嵌入 4096 128
-            posEmbeds = itmEmbeds[genes]  # 正样本嵌入 4096 128
 
             local_negatives_ready = (
                 num_neg_mul != 0 and
@@ -1118,6 +1113,7 @@ class Coach:
             )
 
             if local_negatives_ready:
+                usrEmbeds_local, itmEmbeds_local = self.get_model().forward_gcn(data)
                 labels_np = _to_numpy(labels)
                 mul_genes_np = _to_numpy(mul_genes)
                 negs_mul_genes_labels_np = _to_numpy(negs_mul_genes_labels)
@@ -1141,35 +1137,39 @@ class Coach:
                     negs_mul_drugs_list = self.random_sample_nonzero(negs_mul_drugs_list, num_neg_mul, -1)
                     negs_mul_drugs = t.tensor(negs_mul_drugs_list, device=drugs.device).long()
 
-                zero_item = itmEmbeds.new_zeros(1, itmEmbeds.shape[1])
-                itmEmbeds_local = t.cat((itmEmbeds, zero_item), dim=0)
                 sentinel_item_idx = itmEmbeds_local.size(0) - 1
                 negs_mul_genes = negs_mul_genes.clone()
                 negs_mul_genes[negs_mul_genes < 0] = sentinel_item_idx
-                negEmbeds_gene_local = itmEmbeds_local[negs_mul_genes]
-
-                usrEmbeds_local = usrEmbeds
+                ancEmbeds_local = usrEmbeds_local[drugs]
+                posEmbeds_local = itmEmbeds_local[genes]
                 negEmbeds_drug_local = None
                 if negs_mul_drugs is not None:
-                    zero_user = usrEmbeds.new_zeros(1, usrEmbeds.shape[1])
-                    usrEmbeds_local = t.cat((usrEmbeds, zero_user), dim=0)
+                    zero_user = usrEmbeds_local.new_zeros(1, usrEmbeds_local.shape[1])
+                    usrEmbeds_local = t.cat((usrEmbeds_local, zero_user), dim=0)
                     sentinel_usr_idx = usrEmbeds_local.size(0) - 1
                     negs_mul_drugs = negs_mul_drugs.clone()
                     negs_mul_drugs[negs_mul_drugs < 0] = sentinel_usr_idx
                     negEmbeds_drug_local = usrEmbeds_local[negs_mul_drugs]
 
-                ancEmbeds = usrEmbeds[drugs]
-                posScores_local = innerProduct(ancEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))
-                negScores_gene_local = innerProduct(posEmbeds.unsqueeze(1), negEmbeds_gene_local)
+                posScores_local = innerProduct(ancEmbeds_local.unsqueeze(1), posEmbeds_local.unsqueeze(1))
+                negScores_gene_local = innerProduct(posEmbeds_local.unsqueeze(1), itmEmbeds_local[negs_mul_genes])
                 scoreDiff_local = posScores_local - negScores_gene_local
                 if negEmbeds_drug_local is not None:
-                    negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
+                    negScores_drug_local = innerProduct(ancEmbeds_local.unsqueeze(1), negEmbeds_drug_local)
                     scoreDiff_local = scoreDiff_local - negScores_drug_local
 
                 local_bpr_loss = -(scoreDiff_local).sigmoid().log().sum() / args.batch
+                regLoss_local = calcRegLoss(self.model) * args.reg
+                total_local_loss = local_bpr_loss + regLoss_local
+                self.opt.zero_grad()
+                total_local_loss.backward()
+                self.opt.step()
                 loss_mult_loss += float(local_bpr_loss)
+                reg_loss += float(regLoss_local)
 
-            # 获取混合困难负样本和对应权重
+            usrEmbeds, itmEmbeds = self.get_model().forward_gcn(data)
+            drugEmbeds = usrEmbeds[drugs]
+            posEmbeds = itmEmbeds[genes]
             mixed_hard_negatives, neg_weights = self.get_mixed_hard_negatives(
                 drugs.cpu(), genes.cpu(), num_neighbors=args.num_two_hop,
                 current_epoch=current_epoch, batch_idx=i
@@ -1268,7 +1268,7 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
@@ -1349,7 +1349,7 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='macro', zero_division=0) # 看出模型在“难分类的少样本”上的表现,不加权重地计算平均值
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
