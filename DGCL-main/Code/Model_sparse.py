@@ -5,153 +5,11 @@ from Utils.Utils import contrastLoss, ce, l2_norm, calcRegLoss
 import numpy as np
 import torch_sparse
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
 
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
 
-class Causal_GraphConvolution(nn.Module):
-    """
-    因果图卷积层实现
-    基于注意力机制的因果感知图卷积网络层，用于捕获节点间的因果关系
-
-    参数:
-    - in_features: 输入特征维度
-    - out_features: 输出特征维度
-    - dropout: dropout率
-    - act: 激活函数
-    """
-
-    def __init__(self, in_features, out_features, dropout=0., act=F.relu, ):
-        super(Causal_GraphConvolution, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        # 注意力参数，大小为2倍输出维度，分别用于源节点和目标节点的注意力计算
-        self.a = Parameter(t.empty(size=(2 * out_features, 1)))
-        self.dropout = dropout
-        self.act = act
-        # 特征变换矩阵
-        self.weight = nn.Parameter(t.FloatTensor(in_features, out_features))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """初始化权重参数"""
-        t.nn.init.xavier_uniform_(self.weight)
-
-    def causality_message(self):
-        """
-        预留的因果消息传递接口
-        可用于实现更复杂的因果推理机制
-        """
-        pass
-
-    def _prepare_causality_attention_input(self, Wh):
-        """
-        准备因果注意力的输入
-
-        参数:
-        - Wh: 经过线性变换后的节点特征
-
-        返回:
-        - 注意力分数矩阵
-
-        实现步骤:
-        1. 将注意力参数分为两部分，分别用于源节点和目标节点
-        2. 计算两部分注意力分数
-        3. 组合得到最终的注意力分数
-        """
-        # 计算源节点的注意力分数
-        Wh1 = t.matmul(Wh, self.a[:self.out_features, :])
-        # 计算目标节点的注意力分数
-        Wh2 = t.matmul(Wh, self.a[self.out_features:, :])
-        # 组合注意力分数（广播加法）
-        e = Wh1 + Wh2.T
-        return self.act(e)
-
-    def forward(self, input, adj):
-        """
-        前向传播过程
-
-        参数:
-        - input: 输入特征
-        - adj: 邻接矩阵
-
-        返回:
-        - 更新后的节点特征
-
-        实现步骤:
-        1. 应用dropout
-        2. 对每个输入样本进行因果感知的消息传递
-        3. 聚合所有消息并应用激活函数
-        """
-        # 应用dropout正则化
-        input = F.dropout(input, self.dropout, self.training)
-
-        # 因果感知的消息计算
-        Whs = []
-        # 对每个输入样本进行处理
-        for inp in t.unbind(input, dim=0):
-            # 线性特征变换
-            Wh = t.mm(inp, self.weight)
-            # 计算因果注意力分数
-            e = self._prepare_causality_attention_input(Wh)
-
-            # 创建注意力掩码，将不相连节点的注意力设为很小的负值
-            zero_vec = -5e4 * t.ones_like(e)
-            adj_dense = adj.to_dense()  # 将稀疏邻接矩阵转换为稠密矩阵
-            # 应用邻接矩阵掩码，只保留相连节点间的注意力
-            attention = t.where(adj_dense > 0, e, zero_vec)
-
-            # 注意力归一化
-            attention = F.softmax(attention, dim=1)
-            attention = F.dropout(attention, self.dropout, training=self.training)
-            # 基于注意力权重聚合邻居信息 这里就是计算出来的P
-            h_prime = t.matmul(attention, Wh)
-            Whs.append(h_prime)
-
-        # 堆叠所有处理后的样本
-        support = t.stack(Whs, dim=0)
-
-        # 最终的图卷积操作：对每个样本应用邻接矩阵进行消息传递
-        # 对输入张量 support 的每个切片进行稀疏矩阵乘法（SpMM），再将结果堆叠起来
-        # unbind将张量 support 沿 dim=0（第0维）拆分为多个子张量（切片）
-        # t.spmm(adj, sup)计算稀疏矩阵 adj 与稠密矩阵 sup 的乘积
-        output = t.stack(
-            [t.spmm(adj, sup) for sup in t.unbind(support, dim=0)],
-            dim=0)
-
-        # 应用激活函数
-        output = self.act(output)
-        return output
-
-    def __repr__(self):
-        """返回层的字符串表示"""
-        return self.__class__.__name__ + ' (' \
-            + str(self.in_features) + ' -> ' \
-            + str(self.out_features) + ')'
-
-class SELayer(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        # self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        # 初始化内部序列层的参数
-        for layer in self.fc:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
-                if layer.bias is not None:
-                    nn.init.constant_(layer.bias, 0)
-
-# Adaptive Synergistic Fusion Module (ASFM)  自适应协同融合模块
 # --- 新增：特征级门控拼接层 (Feature-wise Gated Concatenation) ---
 class GatedConcatFusion(nn.Module):
     def __init__(self, latdim):
@@ -230,13 +88,6 @@ class Model(nn.Module):
         self.classifierLayer = ClassifierLayer()
 
         self.edgeDropper = SpAdjDropEdge()
-
-        # 初始化SE注意力层，用于特征重标定
-        # 这里修改为权重shape随超参数embedding size变化
-        # self.seLayer = SELayer(args.latdim)
-
-        # 初始化因果图卷积层，用于捕获节点间的因果关系
-        # self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
 
     def forward(self, adj, keepRate):
         # 步骤 3: GCN 传播 (结构视图)

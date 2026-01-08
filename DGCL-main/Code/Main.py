@@ -1105,15 +1105,19 @@ class Coach:
             genes = genes.long().cuda()
             labels = labels.long().cuda()
             negs = negs.long().cuda()
+            # 得到嵌入用于计算负采样损失
+            usrEmbeds, itmEmbeds = self.get_model().forward_gcn(data)
+            # 获取正样本和负样本的嵌入
+            drugEmbeds = usrEmbeds[drugs]  # 药物嵌入 4096 128
+            posEmbeds = itmEmbeds[genes]  # 正样本嵌入 4096 128
 
             local_negatives_ready = (
-                num_neg_mul != 0 and
-                mul_genes is not None and
-                negs_mul_genes_labels is not None
+                    num_neg_mul != 0 and
+                    mul_genes is not None and
+                    negs_mul_genes_labels is not None
             )
 
             if local_negatives_ready:
-                usrEmbeds_local, itmEmbeds_local = self.get_model().forward_gcn(data)
                 labels_np = _to_numpy(labels)
                 mul_genes_np = _to_numpy(mul_genes)
                 negs_mul_genes_labels_np = _to_numpy(negs_mul_genes_labels)
@@ -1137,39 +1141,35 @@ class Coach:
                     negs_mul_drugs_list = self.random_sample_nonzero(negs_mul_drugs_list, num_neg_mul, -1)
                     negs_mul_drugs = t.tensor(negs_mul_drugs_list, device=drugs.device).long()
 
+                zero_item = itmEmbeds.new_zeros(1, itmEmbeds.shape[1])
+                itmEmbeds_local = t.cat((itmEmbeds, zero_item), dim=0)
                 sentinel_item_idx = itmEmbeds_local.size(0) - 1
                 negs_mul_genes = negs_mul_genes.clone()
                 negs_mul_genes[negs_mul_genes < 0] = sentinel_item_idx
-                ancEmbeds_local = usrEmbeds_local[drugs]
-                posEmbeds_local = itmEmbeds_local[genes]
+                negEmbeds_gene_local = itmEmbeds_local[negs_mul_genes]
+
+                usrEmbeds_local = usrEmbeds
                 negEmbeds_drug_local = None
                 if negs_mul_drugs is not None:
-                    zero_user = usrEmbeds_local.new_zeros(1, usrEmbeds_local.shape[1])
-                    usrEmbeds_local = t.cat((usrEmbeds_local, zero_user), dim=0)
+                    zero_user = usrEmbeds.new_zeros(1, usrEmbeds.shape[1])
+                    usrEmbeds_local = t.cat((usrEmbeds, zero_user), dim=0)
                     sentinel_usr_idx = usrEmbeds_local.size(0) - 1
                     negs_mul_drugs = negs_mul_drugs.clone()
                     negs_mul_drugs[negs_mul_drugs < 0] = sentinel_usr_idx
                     negEmbeds_drug_local = usrEmbeds_local[negs_mul_drugs]
 
-                posScores_local = innerProduct(ancEmbeds_local.unsqueeze(1), posEmbeds_local.unsqueeze(1))
-                negScores_gene_local = innerProduct(posEmbeds_local.unsqueeze(1), itmEmbeds_local[negs_mul_genes])
+                ancEmbeds = usrEmbeds[drugs]
+                posScores_local = innerProduct(ancEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))
+                negScores_gene_local = innerProduct(posEmbeds.unsqueeze(1), negEmbeds_gene_local)
                 scoreDiff_local = posScores_local - negScores_gene_local
                 if negEmbeds_drug_local is not None:
-                    negScores_drug_local = innerProduct(ancEmbeds_local.unsqueeze(1), negEmbeds_drug_local)
+                    negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
                     scoreDiff_local = scoreDiff_local - negScores_drug_local
 
                 local_bpr_loss = -(scoreDiff_local).sigmoid().log().sum() / args.batch
-                regLoss_local = calcRegLoss(self.model) * args.reg
-                total_local_loss = local_bpr_loss + regLoss_local
-                self.opt.zero_grad()
-                total_local_loss.backward()
-                self.opt.step()
                 loss_mult_loss += float(local_bpr_loss)
-                reg_loss += float(regLoss_local)
 
-            usrEmbeds, itmEmbeds = self.get_model().forward_gcn(data)
-            drugEmbeds = usrEmbeds[drugs]
-            posEmbeds = itmEmbeds[genes]
+            # 获取混合困难负样本和对应权重
             mixed_hard_negatives, neg_weights = self.get_mixed_hard_negatives(
                 drugs.cpu(), genes.cpu(), num_neighbors=args.num_two_hop,
                 current_epoch=current_epoch, batch_idx=i
@@ -1220,12 +1220,10 @@ class Coach:
                 hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
                 # hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
 
-
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
                 # neg_loss_value = -F.logsigmoid(scoreDiff2).sum() / args.batch
                 neg_loss_value = -(scoreDiff2).sigmoid().log().sum() / args.batch
-
 
                 if not t.isfinite(hard_loss_value):
                     warn_msg = (
@@ -1238,7 +1236,6 @@ class Coach:
                         self.log_file.write(warn_msg + '\n')
                     hard_loss_value = hard_loss_value.new_tensor(0.0)
 
-
                 if not t.isfinite(neg_loss_value):
                     warn_msg = (
                         f"普通负采样NAN,[Warn] Epoch {current_epoch} batch {i}: "
@@ -1249,7 +1246,6 @@ class Coach:
                     if self.log_file:
                         self.log_file.write(warn_msg + '\n')
                     neg_loss_value = neg_loss_value.new_tensor(0.0)
-
 
                 # bpr_loss_value = hard_loss_value
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
@@ -1268,7 +1264,8 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                total_loss = neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                # total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
@@ -1289,7 +1286,6 @@ class Coach:
                     print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
                     print(f"  Total loss: {total_loss:.4f}")
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
-
 
             # 计算交叉熵损失
             ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
@@ -1326,6 +1322,7 @@ class Coach:
         if num_neg_mul != 0:
             ret['local_neg_loss'] = loss_mult_loss / steps
         return ret
+
     def testEpoch(self):
         self.model.eval()
         tstLoader = self.handler.tstLoader
@@ -1349,8 +1346,9 @@ class Coach:
             pre = pre.detach().cpu()
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='macro', zero_division=0) # 看出模型在“难分类的少样本”上的表现,不加权重地计算平均值
-            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
+            # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
+            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
             probs_list.append(probs.cpu().detach().numpy())
@@ -1481,18 +1479,18 @@ if __name__ == '__main__':
     log('Load Data')
 
     hyperparameters_info = (
-        "\n" + "=" * 60 + "\n" +
-        "🔧 实验超参数配置信息\n" +
-        "=" * 60 + "\n" +
-        f"📊 数据集 (data): {args.data}\n" +
-        f"📈 学习率 (lr): {args.lr}\n" +
-        f"🎲 全局负样本数量 (num_neg): {args.num_neg}\n" +
-        f"🔗 二跳邻居数量 (num_two_hop): {args.num_two_hop}\n" +
-        f"📏 一跳最大比例 (one_hop_max_ratio): {args.one_hop_max_ratio:.1%} ({int(args.num_two_hop * args.one_hop_max_ratio)} max samples)\n" +
-        f"⚖️  一跳权重倍数 (one_hop_weight): {args.one_hop_weight}\n" +
-        f"⚖️  二跳权重倍数 (two_hop_weight): {args.two_hop_weight}\n" +
-        f"⚖️  普通负样本权重 (common_neg_weight): {args.common_neg_weight}\n" +
-        "=" * 60 + "\n"
+            "\n" + "=" * 60 + "\n" +
+            "🔧 实验超参数配置信息\n" +
+            "=" * 60 + "\n" +
+            f"📊 数据集 (data): {args.data}\n" +
+            f"📈 学习率 (lr): {args.lr}\n" +
+            f"🎲 全局负样本数量 (num_neg): {args.num_neg}\n" +
+            f"🔗 二跳邻居数量 (num_two_hop): {args.num_two_hop}\n" +
+            f"📏 一跳最大比例 (one_hop_max_ratio): {args.one_hop_max_ratio:.1%} ({int(args.num_two_hop * args.one_hop_max_ratio)} max samples)\n" +
+            f"⚖️  一跳权重倍数 (one_hop_weight): {args.one_hop_weight}\n" +
+            f"⚖️  二跳权重倍数 (two_hop_weight): {args.two_hop_weight}\n" +
+            f"⚖️  普通负样本权重 (common_neg_weight): {args.common_neg_weight}\n" +
+            "=" * 60 + "\n"
     )
     print(hyperparameters_info)
     log_file.write(hyperparameters_info)
@@ -1676,7 +1674,7 @@ if __name__ == '__main__':
                     continue
 
                 valid_pairs = [(v, e) for v, e in zip(values, epochs) if not np.isnan(v)]
-                
+
                 if not valid_pairs:
                     f.write(f"\n{metric}:\n  无有效数据\n")
                     continue
