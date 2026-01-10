@@ -54,10 +54,19 @@ class Model(nn.Module):
 
         if self.use_text_features:
             # 步骤 2: 加载预训练 LLM 嵌入
-            print("加载预训练的LLM文本嵌入作为辅助特征...")
+            print("=" * 60)
+            print("🔄 加载预训练的LLM文本嵌入作为辅助特征...")
+            print("=" * 60)
+            print(f"📁 药物嵌入文件路径: {args.pretrained_drug_embed_path}")
+            print(f"📁 基因嵌入文件路径: {args.pretrained_gene_embed_path}")
+            
             drug_embeds_text = t.from_numpy(np.load(args.pretrained_drug_embed_path)).float()
             gene_embeds_text = t.from_numpy(np.load(args.pretrained_gene_embed_path)).float()
 
+            print(f"✅ 药物嵌入加载成功: 形状 {drug_embeds_text.shape} (期望: [{args.drug}, *])")
+            print(f"✅ 基因嵌入加载成功: 形状 {gene_embeds_text.shape} (期望: [{args.gene}, *])")
+            print("=" * 60)
+            
             assert drug_embeds_text.shape[0] == args.drug, "Drug count mismatch"
             assert gene_embeds_text.shape[0] == args.gene, "Gene count mismatch"
 

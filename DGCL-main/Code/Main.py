@@ -1264,8 +1264,8 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
-                # total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                # total_loss = neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
@@ -1308,7 +1308,7 @@ class Coach:
 
             # 记录损失
             # bpr_loss += float(bpr_loss_value)
-            hard_loss += hard_loss_value
+
             common_loss += neg_loss_value
             reg_loss += float(regLoss)
 
@@ -1347,8 +1347,8 @@ class Coach:
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
-            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
             probs_list.append(probs.cpu().detach().numpy())
