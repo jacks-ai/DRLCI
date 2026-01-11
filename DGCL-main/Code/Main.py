@@ -1120,7 +1120,7 @@ class Coach:
         }
 
         epLoss, epPreLoss = 0, 0
-        bprLoss, bpr_loss, reg_loss, regLoss, im_loss = 0, 0, 0, 0, 0
+        bprLoss, bpr_loss, im_loss = 0, 0, 0
         hard_loss, common_loss = 0, 0
         loss_mult_loss = 0
 
@@ -1291,25 +1291,18 @@ class Coach:
                     print(f"Score difference mean: {scoreDiff1.mean():.4f}")
                     # print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
 
-                # 梯度累积但分别控制 - 避免损失值差异过大的影响
-                regLoss = calcRegLoss(self.model) * args.reg
-
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                # total_loss = neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
-                # total_loss = neg_loss_value * args.common_neg_weight + regLoss
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight
 
                 # 统一参数更新（基于累积的梯度）
                 total_loss.backward()
                 self.opt.step()
 
                 # 记录损失
-                # bpr_loss += float(bpr_loss_value)
                 hard_loss += hard_loss_value
                 common_loss += neg_loss_value
-                reg_loss += float(regLoss)
 
                 # 只在第一个batch输出分离式损失信息
                 if i == 0 and (current_epoch == 0):
@@ -1318,7 +1311,6 @@ class Coach:
                     print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value / hard_loss_value:.1f}x)")
                     print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
                     print(f"  Total loss: {total_loss:.4f}")
-                    print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 构建因果干预掩码（基于困难负样本）
             # 使用 drugs[i] → mixed_hard_negatives[i] 的映射关系
@@ -1346,9 +1338,7 @@ class Coach:
             
             # 计算交叉熵损失（带因果干预）
             ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate, intervention_mask)
-            regLoss = calcRegLoss(self.model) * args.reg
-            # loss = ceLoss + regLoss
-            loss = ceLoss + regLoss + sslLoss
+            loss = ceLoss + sslLoss
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
@@ -1361,20 +1351,12 @@ class Coach:
             # 使用计算得到的梯度和学习率
             # 使用优化算法（例如 SGD、Adam、RMSprop 等）来更新模型参数
             self.opt.step()
-            # bprLoss = 0
-
-            # 记录损失
-            # bpr_loss += float(bpr_loss_value)
-            common_loss += neg_loss_value
-            reg_loss += float(regLoss)
 
         ret = dict()
         ret['Loss'] = epLoss / steps
-        # ret['sslLoss'] = sslLoss / steps
         ret['preLoss'] = epPreLoss / steps
         ret['common_neg_loss'] = common_loss / steps
         ret['hard_neg_loss'] = hard_loss / steps
-        ret['regLoss'] = reg_loss / steps
         if num_neg_mul != 0:
             ret['local_neg_loss'] = loss_mult_loss / steps
         return ret

@@ -10,32 +10,6 @@ init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
 
-# --- 新增：SE注意力层 (Squeeze-and-Excitation Layer) ---
-class SELayer(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        # 初始化内部序列层的参数
-        for layer in self.fc:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
-                if layer.bias is not None:
-                    nn.init.constant_(layer.bias, 0)
-
-    def forward(self, x):
-        b, c = x.size()
-        y = self.fc(x).view(b, c)
-        return x * y.expand_as(x)
-
-
 # --- 新增：因果图卷积层 (Causal Graph Convolution) ---
 class Causal_GraphConvolution(nn.Module):
     """
@@ -64,6 +38,7 @@ class Causal_GraphConvolution(nn.Module):
     def reset_parameters(self):
         """初始化权重参数"""
         t.nn.init.xavier_uniform_(self.weight)
+        t.nn.init.xavier_uniform_(self.a)
 
     def _prepare_causality_attention_input(self, Wh):
         """
@@ -112,7 +87,7 @@ class Causal_GraphConvolution(nn.Module):
                 attention = t.where(
                     intervention_mask > 0,  # mask=1 的位置保留
                     attention,  # 保留原始注意力分数
-                    t.full_like(attention, -1000.0)  # mask=0 的位置设为 -1000   -inf
+                    t.full_like(attention, -200.0)  # mask=0 的位置设为 -1000   -inf
                 )
 
             # 3. 注意力归一化（-inf 会被 softmax 转为 0）
@@ -217,15 +192,12 @@ class Model(nn.Module):
 
         self.edgeDropper = SpAdjDropEdge()
 
-        # 初始化SE注意力层，用于特征重标定
-        self.seLayer = SELayer(args.latdim)
-
         # 初始化因果图卷积层，用于捕获节点间的因果关系
         self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
 
     def forward(self, adj, keepRate, intervention_mask=None):
         """
-        前向传播（支持因果干预）
+        前向传播（支持因果干预，不使用SE层）
         
         参数:
         - adj: 邻接矩阵
@@ -243,29 +215,21 @@ class Model(nn.Module):
         for i in range(args.gnn_layer):
             # 1. 普通图卷积传递
             gcnEmbeds = self.gcnLayers[i](self.edgeDropper(adj, keepRate), embedsLst[-1])
-            se_weights = self.seLayer(gcnEmbeds)
             gcnEmbedsLst.append(gcnEmbeds)
 
-            # 2. 特征增强：结合SE注意力和残差连接   Global information modeling
-            adjusted_embeds = t.add(gcnEmbeds, se_weights)
-            # 这里是残差连接，将当前层输出与上一层输入相加
-            adjusted_embeds1 = t.add(gcnEmbeds, embedsLst[-1])
-            ae = t.add(adjusted_embeds, adjusted_embeds1)
+            # 2. 残差连接：将当前层输出与上一层输入相加
+            residual_embeds = t.add(gcnEmbeds, embedsLst[-1])
 
             # 3. 因果感知的图卷积传递（应用干预掩码）
             gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj, intervention_mask)  # 传入干预掩码
             gcnEmbeds_c = gcnEmbeds_c.squeeze(0)  # 压缩维度
             causalEmbedsLst.append(gcnEmbeds_c)
 
-            # 4. 因果特征增强：使用SE注意力进行特征重标定
-            gcnEmbeds_c2 = self.seLayer(gcnEmbeds_c)
-            gcnEmbeds_c = t.mul(gcnEmbeds_c2, gcnEmbeds_c)
+            # 4. 特征融合：组合普通GCN和因果GCN的特征
+            fused_embeds = t.add(residual_embeds, gcnEmbeds_c)
+            embedsLst.append(fused_embeds)
 
-            # 5. 特征融合：组合普通GCN和因果GCN的特征
-            xsc = t.add(ae, gcnEmbeds_c)
-            embedsLst.append(xsc)
-
-        # 6. 聚合所有层的特征
+        # 5. 聚合所有层的特征
         final_struct_embeds = sum(embedsLst)
 
         all_text_feat = None
@@ -292,7 +256,7 @@ class Model(nn.Module):
 
     def forward_gcn(self, adj, intervention_mask=None):
         """
-        用于推理或无 Dropout 的前向传播（支持因果干预）
+        用于推理或无 Dropout 的前向传播（支持因果干预，不使用SE层）
         
         参数:
         - adj: 邻接矩阵
@@ -308,28 +272,21 @@ class Model(nn.Module):
         for i in range(args.gnn_layer):
             # 1. 普通图卷积传递
             gcnEmbeds = self.gcnLayers[i](adj, embedsLst[-1])
-            se_weights = self.seLayer(gcnEmbeds)
             gcnEmbedsLst.append(gcnEmbeds)
 
-            # 2. 特征增强：结合SE注意力和残差连接
-            adjusted_embeds = t.add(gcnEmbeds, se_weights)
-            adjusted_embeds1 = t.add(gcnEmbeds, embedsLst[-1])
-            ae = t.add(adjusted_embeds, adjusted_embeds1)
+            # 2. 残差连接：将当前层输出与上一层输入相加
+            residual_embeds = t.add(gcnEmbeds, embedsLst[-1])
 
             # 3. 因果感知的图卷积传递（应用干预掩码）
             gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj, intervention_mask)
             gcnEmbeds_c = gcnEmbeds_c.squeeze(0)
             causalEmbedsLst.append(gcnEmbeds_c)
 
-            # 4. 因果特征增强：使用SE注意力进行特征重标定
-            gcnEmbeds_c2 = self.seLayer(gcnEmbeds_c)
-            gcnEmbeds_c = t.mul(gcnEmbeds_c2, gcnEmbeds_c)
+            # 4. 特征融合：组合普通GCN和因果GCN的特征
+            fused_embeds = t.add(residual_embeds, gcnEmbeds_c)
+            embedsLst.append(fused_embeds)
 
-            # 5. 特征融合：组合普通GCN和因果GCN的特征
-            xsc = t.add(ae, gcnEmbeds_c)
-            embedsLst.append(xsc)
-
-        # 6. 聚合所有层的特征
+        # 5. 聚合所有层的特征
         final_struct_embeds = sum(embedsLst)
 
         if self.use_text_features:
