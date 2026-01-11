@@ -1320,8 +1320,32 @@ class Coach:
                     print(f"  Total loss: {total_loss:.4f}")
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
-            # 计算交叉熵损失
-            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            # 构建因果干预掩码（基于困难负样本）
+            # 使用 drugs[i] → mixed_hard_negatives[i] 的映射关系
+            intervention_mask = self.build_intervention_mask(drugs.cpu(), mixed_hard_negatives.cpu())
+            intervention_mask = intervention_mask.cuda()
+            
+            if current_epoch == 0 and i == 0:
+                # 统计干预掩码的稀疏度
+                total_edges = intervention_mask.numel()
+                intervened_edges = (intervention_mask == 0).sum().item()
+                print(f"\n🔪 Causal Intervention Mask Statistics:")
+                print(f"  Total possible edges: {total_edges}")
+                print(f"  Intervened edges (cut off): {intervened_edges}")
+                print(f"  Intervention ratio: {intervened_edges / total_edges * 100:.4f}%")
+                
+                # 验证映射关系：检查前3个样本的映射
+                print(f"\n🔍 Verifying Drug-HardNegative Mapping (first 3 samples):")
+                for idx in range(min(3, len(drugs))):
+                    drug_id = drugs[idx].item()
+                    gene_id = genes[idx].item()
+                    hard_neg_ids = mixed_hard_negatives[idx].cpu().tolist()[:5]  # 只显示前5个
+                    print(f"  Sample {idx}: Drug={drug_id}, Gene={gene_id}")
+                    print(f"    → Hard negatives: {hard_neg_ids}")
+                    print(f"    → Intervention: Cut edges between Drug {drug_id} and Genes {hard_neg_ids}")
+            
+            # 计算交叉熵损失（带因果干预）
+            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate, intervention_mask)
             regLoss = calcRegLoss(self.model) * args.reg
             # loss = ceLoss + regLoss
             loss = ceLoss + regLoss + sslLoss
@@ -1397,7 +1421,7 @@ class Coach:
             # 原因：你关心的是所有类别（包括少数类）的表现是否均衡。如果使用
             # 'weighted'，模型可能在多数类上表现好就拉高整体分数，掩盖了对少数类的糟糕预测。
             try:
-                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') # weighted
+                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
                 num_classes = all_probs.shape[1]
                 y_true_bin = label_binarize(all_labels, classes=range(num_classes))
                 auprc = average_precision_score(y_true_bin, all_probs, average='macro')

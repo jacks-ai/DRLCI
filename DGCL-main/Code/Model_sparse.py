@@ -106,12 +106,13 @@ class Causal_GraphConvolution(nn.Module):
 
             # 2. 【关键】应用因果干预掩码（Do-operator）
             if intervention_mask is not None:
-                # 将需要切断的连接（mask=0）设为 -inf
-                # 这样 softmax 后这些位置的权重会变为 0
+                # 将需要切断的连接（mask=0）设为 -1000（大负数）
+                # 这样 softmax 后这些位置的权重会变为接近 0
+                # 使用 -1000 而非 -inf 可以避免潜在的 NaN 问题
                 attention = t.where(
                     intervention_mask > 0,  # mask=1 的位置保留
                     attention,  # 保留原始注意力分数
-                    t.full_like(attention, float('-inf'))  # mask=0 的位置设为 -inf
+                    t.full_like(attention, -1000.0)  # mask=0 的位置设为 -1000   -inf
                 )
 
             # 3. 注意力归一化（-inf 会被 softmax 转为 0）
@@ -379,11 +380,11 @@ class Model(nn.Module):
             embeds2 = causalEmbedsLst[i]
 
             # 分别计算药物和基因的对比损失
-            sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
-                                    args.temp) + contrastLoss(
-                embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
+            # sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
+            #                         args.temp) + contrastLoss(
+            #     embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
 
-        return ceLoss, sslLoss
+        return ceLoss, 0
 
     def predict(self, adj, drugs, genes, intervention_mask=None):
         """
