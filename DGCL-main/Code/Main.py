@@ -1046,6 +1046,39 @@ class Coach:
 
         return sorted_indices, sorted_scores
 
+    def build_intervention_mask(self, drugs_batch, hard_negatives_batch):
+        """
+        构建因果干预掩码，用于切断药物与困难负样本（混淆因子）之间的信息流
+        
+        参数:
+        - drugs_batch: [batch_size] - 药物索引批次
+        - hard_negatives_batch: [batch_size, num_hard_neg] - 困难负样本基因索引
+        
+        返回:
+        - intervention_mask: [num_drugs + num_genes, num_drugs + num_genes] - 稀疏干预掩码
+          值为0的位置表示需要切断的连接（do-operator干预点）
+          值为1的位置表示保留的连接
+        """
+        # 创建全1掩码（默认保留所有连接）
+        total_nodes = args.drug + args.gene
+        intervention_mask = t.ones(total_nodes, total_nodes, device=drugs_batch.device)
+        
+        # 对每个药物-困难负样本对，将掩码设为0（切断连接）
+        for i, drug_idx in enumerate(drugs_batch):
+            drug_idx = drug_idx.item() if hasattr(drug_idx, 'item') else int(drug_idx)
+            hard_negs = hard_negatives_batch[i]
+            
+            for hard_neg_gene in hard_negs:
+                hard_neg_gene = hard_neg_gene.item() if hasattr(hard_neg_gene, 'item') else int(hard_neg_gene)
+                # 基因在邻接矩阵中的索引需要加上药物数量的偏移
+                gene_idx_in_adj = args.drug + hard_neg_gene
+                
+                # 双向切断：drug -> gene 和 gene -> drug
+                intervention_mask[drug_idx, gene_idx_in_adj] = 0
+                intervention_mask[gene_idx_in_adj, drug_idx] = 0
+        
+        return intervention_mask
+
     # Function to train a single epoch
     # 返回损失值 更新参数
     def trainEpoch(self, current_epoch, iteration_count):
@@ -1308,7 +1341,6 @@ class Coach:
 
             # 记录损失
             # bpr_loss += float(bpr_loss_value)
-
             common_loss += neg_loss_value
             reg_loss += float(regLoss)
 
@@ -1347,7 +1379,8 @@ class Coach:
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='macro', zero_division=0)
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
@@ -1364,7 +1397,7 @@ class Coach:
             # 原因：你关心的是所有类别（包括少数类）的表现是否均衡。如果使用
             # 'weighted'，模型可能在多数类上表现好就拉高整体分数，掩盖了对少数类的糟糕预测。
             try:
-                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
+                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') # weighted
                 num_classes = all_probs.shape[1]
                 y_true_bin = label_binarize(all_labels, classes=range(num_classes))
                 auprc = average_precision_score(y_true_bin, all_probs, average='macro')
