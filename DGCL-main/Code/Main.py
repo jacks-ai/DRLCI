@@ -1046,39 +1046,6 @@ class Coach:
 
         return sorted_indices, sorted_scores
 
-    def build_intervention_mask(self, drugs_batch, hard_negatives_batch):
-        """
-        构建因果干预掩码，用于切断药物与困难负样本（混淆因子）之间的信息流
-        
-        参数:
-        - drugs_batch: [batch_size] - 药物索引批次
-        - hard_negatives_batch: [batch_size, num_hard_neg] - 困难负样本基因索引
-        
-        返回:
-        - intervention_mask: [num_drugs + num_genes, num_drugs + num_genes] - 稀疏干预掩码
-          值为0的位置表示需要切断的连接（do-operator干预点）
-          值为1的位置表示保留的连接
-        """
-        # 创建全1掩码（默认保留所有连接）
-        total_nodes = args.drug + args.gene
-        intervention_mask = t.ones(total_nodes, total_nodes, device=drugs_batch.device)
-        
-        # 对每个药物-困难负样本对，将掩码设为0（切断连接）
-        for i, drug_idx in enumerate(drugs_batch):
-            drug_idx = drug_idx.item() if hasattr(drug_idx, 'item') else int(drug_idx)
-            hard_negs = hard_negatives_batch[i]
-            
-            for hard_neg_gene in hard_negs:
-                hard_neg_gene = hard_neg_gene.item() if hasattr(hard_neg_gene, 'item') else int(hard_neg_gene)
-                # 基因在邻接矩阵中的索引需要加上药物数量的偏移
-                gene_idx_in_adj = args.drug + hard_neg_gene
-                
-                # 双向切断：drug -> gene 和 gene -> drug
-                intervention_mask[drug_idx, gene_idx_in_adj] = 0
-                intervention_mask[gene_idx_in_adj, drug_idx] = 0
-        
-        return intervention_mask
-
     # Function to train a single epoch
     # 返回损失值 更新参数
     def trainEpoch(self, current_epoch, iteration_count):
@@ -1120,7 +1087,7 @@ class Coach:
         }
 
         epLoss, epPreLoss = 0, 0
-        bprLoss, bpr_loss, im_loss = 0, 0, 0
+        bprLoss, bpr_loss, reg_loss, regLoss, im_loss = 0, 0, 0, 0, 0
         hard_loss, common_loss = 0, 0
         loss_mult_loss = 0
 
@@ -1194,12 +1161,25 @@ class Coach:
                 ancEmbeds = usrEmbeds[drugs]
                 posScores_local = innerProduct(ancEmbeds.unsqueeze(1), posEmbeds.unsqueeze(1))
                 negScores_gene_local = innerProduct(posEmbeds.unsqueeze(1), negEmbeds_gene_local)
+                
+                # 局部负样本损失：从BPR改为BCE
+                # BPR损失（已注释）:
                 scoreDiff_local = posScores_local - negScores_gene_local
                 if negEmbeds_drug_local is not None:
                     negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
                     scoreDiff_local = scoreDiff_local - negScores_drug_local
-
                 local_bpr_loss = -(scoreDiff_local).sigmoid().log().sum() / args.batch
+                
+                # BCE损失（标准公式）：
+                # if negEmbeds_drug_local is not None:
+                #     negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
+                #     # 合并gene和drug负样本：[batch_size, num_neg_mul*2]
+                #     all_neg_scores = t.cat([negScores_gene_local, negScores_drug_local], dim=1)
+                #     local_bce_loss = -t.mean(F.logsigmoid(posScores_local) + F.logsigmoid(-all_neg_scores))
+                # else:
+                #     # 只有gene负样本
+                #     local_bce_loss = -t.mean(F.logsigmoid(posScores_local) + F.logsigmoid(-negScores_gene_local))
+                
                 loss_mult_loss += float(local_bpr_loss)
 
             # 获取混合困难负样本和对应权重
@@ -1242,21 +1222,29 @@ class Coach:
                 hard_negScores = innerProduct(drugEmbeds.unsqueeze(1),
                                               mixed_hard_neg_embeds)  # [batch_size, num_two_hop]
                 # 普通负样本分数
-                negScores = innerProduct(drugEmbeds.unsqueeze(1), negEmbeds)  # [batch_size, num_two_hop]
+                negScores = innerProduct(drugEmbeds.unsqueeze(1), negEmbeds)
 
                 # 应用权重并求和
                 weighted_negScores = hard_negScores * neg_weights  # [batch_size, num_two_hop]
                 aggregated_negScore = weighted_negScores.sum(dim=1, keepdim=True)  # [batch_size, 1]
 
-                # 计算加权BPR损失
+                # 困难负样本损失：从BPR改为BCE
+                # BPR损失（已注释）:
                 scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
-                hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
-                # hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
+                #hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
+                hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
+                
+                # BCE损失（标准公式）：
+                # hard_loss_value = -t.mean(F.logsigmoid(posScores) + F.logsigmoid(-hard_negScores))
 
                 # sum() 不带任何参数时，会对张量的所有元素求和，直接返回一个标量张量（0维张量）
+                # 普通负样本损失：从BPR改为BCE
+                # BPR损失
                 scoreDiff2 = posScores - negScores  # [batch_size, 1]
-                # neg_loss_value = -F.logsigmoid(scoreDiff2).sum() / args.batch
                 neg_loss_value = -(scoreDiff2).sigmoid().log().sum() / args.batch
+                
+                # BCE损失：
+                # neg_loss_value = -t.mean(F.logsigmoid(posScores) + F.logsigmoid(-negScores))
 
                 if not t.isfinite(hard_loss_value):
                     warn_msg = (
@@ -1288,21 +1276,28 @@ class Coach:
                     print(f"Weighted negative scores mean: {weighted_negScores.mean():.4f}")
                     print(f"Aggregated negative score mean: {aggregated_negScore.mean():.4f}")
                     print(f"Average weight per sample: {neg_weights.mean():.4f}")
-                    print(f"Score difference mean: {scoreDiff1.mean():.4f}")
+                    # print(f"Score difference mean: {scoreDiff1.mean():.4f}")
                     # print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
+
+                # 梯度累积但分别控制 - 避免损失值差异过大的影响
+                regLoss = calcRegLoss(self.model) * args.reg
 
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight
+                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                #total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
                 total_loss.backward()
                 self.opt.step()
 
                 # 记录损失
+                # bpr_loss += float(bpr_loss_value)
                 hard_loss += hard_loss_value
                 common_loss += neg_loss_value
+                reg_loss += float(regLoss)
 
                 # 只在第一个batch输出分离式损失信息
                 if i == 0 and (current_epoch == 0):
@@ -1311,34 +1306,13 @@ class Coach:
                     print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value / hard_loss_value:.1f}x)")
                     print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
                     print(f"  Total loss: {total_loss:.4f}")
+                    print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
-            # 构建因果干预掩码（基于困难负样本）
-            # 使用 drugs[i] → mixed_hard_negatives[i] 的映射关系
-            intervention_mask = self.build_intervention_mask(drugs.cpu(), mixed_hard_negatives.cpu())
-            intervention_mask = intervention_mask.cuda()
-            
-            if current_epoch == 0 and i == 0:
-                # 统计干预掩码的稀疏度
-                total_edges = intervention_mask.numel()
-                intervened_edges = (intervention_mask == 0).sum().item()
-                print(f"\n🔪 Causal Intervention Mask Statistics:")
-                print(f"  Total possible edges: {total_edges}")
-                print(f"  Intervened edges (cut off): {intervened_edges}")
-                print(f"  Intervention ratio: {intervened_edges / total_edges * 100:.4f}%")
-                
-                # 验证映射关系：检查前3个样本的映射
-                print(f"\n🔍 Verifying Drug-HardNegative Mapping (first 3 samples):")
-                for idx in range(min(3, len(drugs))):
-                    drug_id = drugs[idx].item()
-                    gene_id = genes[idx].item()
-                    hard_neg_ids = mixed_hard_negatives[idx].cpu().tolist()[:5]  # 只显示前5个
-                    print(f"  Sample {idx}: Drug={drug_id}, Gene={gene_id}")
-                    print(f"    → Hard negatives: {hard_neg_ids}")
-                    print(f"    → Intervention: Cut edges between Drug {drug_id} and Genes {hard_neg_ids}")
-            
-            # 计算交叉熵损失（带因果干预）
-            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate, intervention_mask)
-            loss = ceLoss + sslLoss
+            # 计算交叉熵损失
+            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            regLoss = calcRegLoss(self.model) * args.reg
+            # loss = ceLoss + regLoss
+            loss = ceLoss + regLoss + sslLoss
             # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
@@ -1351,12 +1325,21 @@ class Coach:
             # 使用计算得到的梯度和学习率
             # 使用优化算法（例如 SGD、Adam、RMSprop 等）来更新模型参数
             self.opt.step()
+            # bprLoss = 0
+
+            # 记录损失
+            # bpr_loss += float(bpr_loss_value)
+            hard_loss += hard_loss_value
+            common_loss += neg_loss_value
+            reg_loss += float(regLoss)
 
         ret = dict()
         ret['Loss'] = epLoss / steps
+        # ret['sslLoss'] = sslLoss / steps
         ret['preLoss'] = epPreLoss / steps
         ret['common_neg_loss'] = common_loss / steps
         ret['hard_neg_loss'] = hard_loss / steps
+        ret['regLoss'] = reg_loss / steps
         if num_neg_mul != 0:
             ret['local_neg_loss'] = loss_mult_loss / steps
         return ret
@@ -1385,8 +1368,7 @@ class Coach:
             labels = labels.detach().cpu()
             epAcc = accuracy_score(labels, pre)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
-            # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='macro', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels.cpu().numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
@@ -1403,7 +1385,7 @@ class Coach:
             # 原因：你关心的是所有类别（包括少数类）的表现是否均衡。如果使用
             # 'weighted'，模型可能在多数类上表现好就拉高整体分数，掩盖了对少数类的糟糕预测。
             try:
-                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+                auc_score = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
                 num_classes = all_probs.shape[1]
                 y_true_bin = label_binarize(all_labels, classes=range(num_classes))
                 auprc = average_precision_score(y_true_bin, all_probs, average='macro')
