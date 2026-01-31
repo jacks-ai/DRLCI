@@ -1224,14 +1224,12 @@ class Coach:
                 # 普通负样本分数
                 negScores = innerProduct(drugEmbeds.unsqueeze(1), negEmbeds)
 
-                # 应用权重并求和
+                # 应用权重（不求和，保持与普通负样本一致的计算方式）这样才和正样本嵌入对等
                 weighted_negScores = hard_negScores * neg_weights  # [batch_size, num_two_hop]
-                aggregated_negScore = weighted_negScores.sum(dim=1, keepdim=True)  # [batch_size, 1]
 
-                # 困难负样本损失：从BPR改为BCE
-                # BPR损失（已注释）:
-                scoreDiff1 = posScores - aggregated_negScore  # [batch_size, 1]
-                #hard_loss_value = -F.logsigmoid(scoreDiff1).sum() / args.batch
+                # 困难负样本损失：BPR损失（正负样本平衡版本）
+                # posScores会自动广播: [batch_size, 1] -> [batch_size, num_two_hop]
+                scoreDiff1 = posScores - weighted_negScores  # [batch_size, num_two_hop]
                 hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
                 
                 # BCE损失（标准公式）：
@@ -1274,7 +1272,6 @@ class Coach:
                     print(f"Positive scores shape: {posScores.shape}, mean: {posScores.mean():.4f}")
                     print(f"Raw negative scores shape: {hard_negScores.shape}, mean: {negScores.mean():.4f}")
                     print(f"Weighted negative scores mean: {weighted_negScores.mean():.4f}")
-                    print(f"Aggregated negative score mean: {aggregated_negScore.mean():.4f}")
                     print(f"Average weight per sample: {neg_weights.mean():.4f}")
                     # print(f"Score difference mean: {scoreDiff1.mean():.4f}")
                     # print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
@@ -1286,7 +1283,7 @@ class Coach:
                 self.opt.zero_grad()
                 # 计算总损失用于记录
                 total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
-                #total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
+                # total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
