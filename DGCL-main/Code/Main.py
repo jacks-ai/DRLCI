@@ -1224,13 +1224,16 @@ class Coach:
                 # 普通负样本分数
                 negScores = innerProduct(drugEmbeds.unsqueeze(1), negEmbeds)
 
-                # 应用权重（不求和，保持与普通负样本一致的计算方式）这样才和正样本嵌入对等
-                weighted_negScores = hard_negScores * neg_weights  # [batch_size, num_two_hop]
-
-                # 困难负样本损失：BPR损失（正负样本平衡版本）
+                # 困难负样本损失：先计算分数差，再对差值加权（一跳和二跳使用不同权重）
                 # posScores会自动广播: [batch_size, 1] -> [batch_size, num_two_hop]
-                scoreDiff1 = posScores - weighted_negScores  # [batch_size, num_two_hop]
-                hard_loss_value = -(scoreDiff1).sigmoid().log().sum() / args.batch
+                scoreDiff1 = posScores - hard_negScores  # [batch_size, num_two_hop]
+                
+                # 将权重乘到差值上（区分一跳和二跳）
+                # 一跳样本：(s_pos - s_neg) × 2.0
+                # 二跳样本：(s_pos - s_neg) × 1.2
+                weighted_scoreDiff1 = scoreDiff1 * neg_weights  # [batch_size, num_two_hop]
+
+                hard_loss_value = -(weighted_scoreDiff1).sigmoid().log().sum() / args.batch
                 
                 # BCE损失（标准公式）：
                 # hard_loss_value = -t.mean(F.logsigmoid(posScores) + F.logsigmoid(-hard_negScores))
@@ -1270,11 +1273,13 @@ class Coach:
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
                 if current_epoch == 0 and i == 0:
                     print(f"Positive scores shape: {posScores.shape}, mean: {posScores.mean():.4f}")
-                    print(f"Raw negative scores shape: {hard_negScores.shape}, mean: {negScores.mean():.4f}")
-                    print(f"Weighted negative scores mean: {weighted_negScores.mean():.4f}")
+                    print(f"Hard negative scores shape: {hard_negScores.shape}, mean: {hard_negScores.mean():.4f}")
+                    print(f"Common negative scores shape: {negScores.shape}, mean: {negScores.mean():.4f}")
+                    print(f"Score difference (scoreDiff1) mean: {scoreDiff1.mean():.4f}")
+                    print(f"Weighted score difference mean: {weighted_scoreDiff1.mean():.4f}")
                     print(f"Average weight per sample: {neg_weights.mean():.4f}")
-                    # print(f"Score difference mean: {scoreDiff1.mean():.4f}")
-                    # print(f"Weighted BPR loss: {bpr_loss_value:.4f}")
+                    print(f"Hard loss: {hard_loss_value:.4f}, Common loss: {neg_loss_value:.4f}")
+                    print(f"Hard loss: {hard_loss_value:.4f}, Common loss: {neg_loss_value:.4f}")
 
                 # 梯度累积但分别控制 - 避免损失值差异过大的影响
                 regLoss = calcRegLoss(self.model) * args.reg
@@ -1282,7 +1287,7 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss + local_bpr_loss
+                total_loss = hard_loss_value + neg_loss_value + regLoss + local_bpr_loss
                 # total_loss = hard_loss_value + neg_loss_value * args.common_neg_weight + regLoss
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
