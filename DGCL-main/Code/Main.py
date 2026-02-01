@@ -1452,7 +1452,7 @@ class Coach:
             
             epAcc = accuracy_score(labels_cpu, pre_cpu)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
-            precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='weighted', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='macro', zero_division=0)
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
             labels_list.append(labels_cpu.numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
