@@ -27,7 +27,7 @@ import multiprocessing
 from datetime import datetime
 
 
-# Function to set random seed for reproducibility
+# Function to set random seed for reproducibility 2675
 # 通过设置一个固定的种子值，我们可以确保每次实验的初始化和随机过程相同，从而使得实验的结果可重复
 def set_seed(seed):
     print(seed)
@@ -46,6 +46,61 @@ def set_seed(seed):
         # 消除算法本身的不确定性（如某些浮点运算的舍入误差），确保 GPU 计算结果严格一致
         # 可能牺牲部分性能
         t.backends.cudnn.deterministic = True  # 是否强制 cuDNN 使用确定性算法
+
+
+# Function to log all error cases from all iterations
+def log_all_error_cases(all_iteration_errors, log_file):
+    """
+    将所有iteration的错误案例格式化输出到日志
+    
+    参数:
+    all_iteration_errors: 列表，每个元素包含一个iteration的错误信息
+    log_file: 已打开的日志文件对象
+    """
+    error_log = [
+        "\n" + "=" * 60,
+        "🔍 错误案例分析（每个Iteration的最佳Epoch）",
+        "=" * 60 + "\n"
+    ]
+    
+    for iter_info in all_iteration_errors:
+        iteration = iter_info['iteration']
+        best_epoch = iter_info['best_epoch']
+        best_acc = iter_info['best_acc']
+        error_cases = iter_info['error_cases']
+        
+        error_log.append(f"\n{'=' * 60}")
+        error_log.append(f"Iteration {iteration} - Best Epoch: {best_epoch} - ACC: {best_acc:.4f}")
+        error_log.append(f"{'=' * 60}")
+        error_log.append(f"错误案例数: {len(error_cases)}")
+        
+        if len(error_cases) > 0:
+            error_log.append("\n药物ID\t基因ID\t预测标签\t真实标签")
+            error_log.append("-" * 60)
+            
+            for case in error_cases:
+                error_log.append(
+                    f"{case['drug']}\t{case['gene']}\t"
+                    f"{case['predicted']}\t{case['actual']}"
+                )
+        else:
+            error_log.append("✅ 无错误案例（完美预测）")
+    
+    # 统计信息
+    total_errors = sum(len(iter_info['error_cases']) for iter_info in all_iteration_errors)
+    avg_errors = total_errors / len(all_iteration_errors) if all_iteration_errors else 0
+    
+    error_log.append(f"\n{'=' * 60}")
+    error_log.append("📊 总体统计")
+    error_log.append(f"{'=' * 60}")
+    error_log.append(f"总Iteration数: {len(all_iteration_errors)}")
+    error_log.append(f"总错误案例数: {total_errors}")
+    error_log.append(f"平均每个Iteration错误数: {avg_errors:.2f}")
+    error_log.append("=" * 60 + "\n")
+    
+    error_text = '\n'.join(error_log)
+    print(error_text)
+    log_file.write(error_text + '\n')
 
 
 # Define the Coach class for model training and evaluation
@@ -185,6 +240,8 @@ class Coach:
 
         aucMax = 0
         bestEpoch = 0
+        best_errors_in_iteration = []  # 新增：跟踪iteration内最佳epoch的错误案例
+        best_acc_in_iteration = 0  # 新增：跟踪iteration内最佳ACC
 
         test_r = {met: float('nan') for met in self.metrics_to_track}
 
@@ -206,7 +263,7 @@ class Coach:
                     if self.log_file:
                         self.log_file.write(output_str + '\n')
                     # 返回当前最佳结果，继续下一个iteration
-                    return aucMax, output_str, aucMax, nan_metrics
+                    return aucMax, output_str, aucMax, nan_metrics, [], bestEpoch, aucMax
                 else:
                     output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                     print(output_str)
@@ -214,12 +271,12 @@ class Coach:
                         self.log_file.write(output_str + '\n')
                     print("➡️ Continuing to next iteration...")
                     # 没有有效结果，返回NAN，但继续下一个iteration
-                    return float('nan'), output_str, float('nan'), nan_metrics
+                    return float('nan'), output_str, float('nan'), nan_metrics, [], -1, 0.0
 
             # 记录训练结果
             log(self.makePrint('Train', ep, reses, tstFlag))
             if tstFlag:
-                reses = self.testEpoch()
+                reses, error_cases = self.testEpoch()  # 接收错误案例
                 test_r = reses
 
                 # NAN检测：检查测试结果是否包含NAN
@@ -235,7 +292,7 @@ class Coach:
                         if self.log_file:
                             self.log_file.write(output_str + '\n')
                         # 返回当前最佳结果，继续下一个iteration
-                        return aucMax, output_str, aucMax, nan_metrics
+                        return aucMax, output_str, aucMax, nan_metrics, best_errors_in_iteration, bestEpoch, best_acc_in_iteration
                     else:
                         output_str = f'🛑 Iteration stopped due to NAN at epoch {ep}. No valid test results yet.'
                         print(output_str)
@@ -243,11 +300,16 @@ class Coach:
                             self.log_file.write(output_str + '\n')
                         print("➡️ Continuing to next iteration...")
                         # 没有有效结果，返回NAN，但继续下一个iteration
-                        return float('nan'), output_str, float('nan'), nan_metrics
+                        return float('nan'), output_str, float('nan'), nan_metrics, [], -1, 0.0
 
                 if reses['Acc'] > aucMax:
                     aucMax = reses['Acc']
                     bestEpoch = ep
+                
+                # 更新iteration内的最佳结果
+                if reses['Acc'] > best_acc_in_iteration:
+                    best_acc_in_iteration = reses['Acc']
+                    best_errors_in_iteration = error_cases
 
                 # 记录测试结果
                 log(self.makePrint('Test', ep, reses, tstFlag))
@@ -263,9 +325,14 @@ class Coach:
         # 这里没有权限来保存图片
         #        plt.savefig('/home/huangpeng/DGCL-main/dgcl{}.png'.format(i))
 
-        reses = self.testEpoch()
+        reses, final_error_cases = self.testEpoch()
         log(self.makePrint('Test', args.epoch, reses, True))
         update_best_metrics(reses, args.epoch)
+        
+        # 如果最终测试的ACC更高，更新最佳错误案例
+        if reses['Acc'] > best_acc_in_iteration:
+            best_acc_in_iteration = reses['Acc']
+            best_errors_in_iteration = final_error_cases
 
         self.save_model('{}'.format(config['iteration']))
 
@@ -331,7 +398,7 @@ class Coach:
             for metric in self.metrics_to_track
         }
 
-        return reses['Acc'], output_str, aucMax, iteration_best_metrics
+        return reses['Acc'], output_str, aucMax, iteration_best_metrics, best_errors_in_iteration, bestEpoch, best_acc_in_iteration
 
     # Function to prepare the model and optimizer
     def prepareModel(self):
@@ -1351,6 +1418,7 @@ class Coach:
         tstLoader = self.handler.tstLoader
         labels_list = []
         probs_list = []  # 新增：用于存储预测概率
+        error_cases = []  # 新增：存储错误案例
         i = 0
         for tem in tstLoader:  # for i, tem in enumerate(trnLoader)
             i += 1
@@ -1366,13 +1434,27 @@ class Coach:
             # 选出可能性最大的类别，优化GPU->CPU传输
             pre = pre.data.max(1, keepdim=True)[1]
             # 批量转移到CPU，减少传输次数
-            pre = pre.detach().cpu()
-            labels = labels.detach().cpu()
-            epAcc = accuracy_score(labels, pre)
+            pre_cpu = pre.squeeze().detach().cpu()
+            labels_cpu = labels.detach().cpu()
+            drugs_cpu = drugs.detach().cpu()
+            genes_cpu = genes.detach().cpu()
+            
+            # 收集错误案例
+            incorrect_mask = (pre_cpu != labels_cpu)
+            for idx in range(len(labels_cpu)):
+                if incorrect_mask[idx]:
+                    error_cases.append({
+                        'drug': drugs_cpu[idx].item(),
+                        'gene': genes_cpu[idx].item(),
+                        'predicted': pre_cpu[idx].item(),
+                        'actual': labels_cpu[idx].item()
+                    })
+            
+            epAcc = accuracy_score(labels_cpu, pre_cpu)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
-            precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='weighted', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='weighted', zero_division=0)
             # precision, recall, f1, _ = precision_recall_fscore_support(labels, pre, average='binary')
-            labels_list.append(labels.cpu().numpy())
+            labels_list.append(labels_cpu.numpy())
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
             probs_list.append(probs.cpu().detach().numpy())
 
@@ -1417,7 +1499,7 @@ class Coach:
 
         ret = {'Acc': epAcc, 'F1': f1, 'AUC': auc_score,
                'precision': precision, 'recall': recall, 'Auprc': auprc}
-        return ret
+        return ret, error_cases
 
     # Function to load a pre-trained model
     def loadModel(self):
@@ -1534,6 +1616,7 @@ if __name__ == '__main__':
     aucMax = 0
     overall_iteration_best = {met: [] for met in coach.metrics_to_track}
     best_epochs_per_metric = {met: [] for met in coach.metrics_to_track}
+    all_iteration_errors = []  # 新增：存储每个iteration的错误案例
 
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
@@ -1543,8 +1626,19 @@ if __name__ == '__main__':
         set_seed(seed)
         if args.data == 'LINCS':
             result = coach.external_test_run()
+            best_errors = []
+            best_epoch = -1
+            best_acc = 0.0
         else:
-            result, output_str, aucMax, iteration_best_metrics = coach.run(i)  # 返回最终测试得到的reses['Acc']
+            result, output_str, aucMax, iteration_best_metrics, best_errors, best_epoch, best_acc = coach.run(i)  # 返回最终测试得到的reses['Acc']
+        
+        # 保存当前iteration的错误案例信息
+        all_iteration_errors.append({
+            'iteration': i + 1,
+            'best_epoch': best_epoch,
+            'best_acc': best_acc,
+            'error_cases': best_errors
+        })
 
         # 处理NAN结果：记录但继续下一个iteration
         if np.isnan(result):

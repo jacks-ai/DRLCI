@@ -10,100 +10,6 @@ init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
 
-# --- 新增：因果图卷积层 (Causal Graph Convolution) ---
-class Causal_GraphConvolution(nn.Module):
-    """
-    因果图卷积层实现
-    基于注意力机制的因果感知图卷积网络层，用于捕获节点间的因果关系
-
-    参数:
-    - in_features: 输入特征维度
-    - out_features: 输出特征维度
-    - dropout: dropout率
-    - act: 激活函数
-    """
-
-    def __init__(self, in_features, out_features, dropout=0., act=F.relu):
-        super(Causal_GraphConvolution, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        # 注意力参数，大小为2倍输出维度，分别用于源节点和目标节点的注意力计算
-        self.a = nn.Parameter(t.empty(size=(2 * out_features, 1)))
-        self.dropout = dropout
-        self.act = act
-        # 特征变换矩阵
-        self.weight = nn.Parameter(t.FloatTensor(in_features, out_features))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """初始化权重参数"""
-        t.nn.init.xavier_uniform_(self.weight)
-        t.nn.init.xavier_uniform_(self.a)
-
-    def _prepare_causality_attention_input(self, Wh):
-        """
-        准备因果注意力的输入
-
-        参数:
-        - Wh: 经过线性变换后的节点特征
-
-        返回:
-        - 注意力分数矩阵
-        """
-        # 计算源节点的注意力分数
-        Wh1 = t.matmul(Wh, self.a[:self.out_features, :])
-        # 计算目标节点的注意力分数
-        Wh2 = t.matmul(Wh, self.a[self.out_features:, :])
-        # 组合注意力分数（广播加法）
-        e = Wh1 + Wh2.T
-        return self.act(e)
-
-    def forward(self, input, adj, intervention_mask=None):
-        """
-        参数:
-        - input: 输入特征
-        - adj: 邻接矩阵
-        - intervention_mask: [num_nodes, num_nodes] 因果干预掩码
-                            值为0的位置表示需要切断的连接
-                            值为1的位置表示保留的连接
-        """
-        input = F.dropout(input, self.dropout, self.training)
-
-        Whs = []
-        for inp in t.unbind(input, dim=0):
-            Wh = t.mm(inp, self.weight)
-            e = self._prepare_causality_attention_input(Wh)
-
-            # 1. 应用邻接矩阵掩码（保留图结构）
-            zero_vec = -5e4 * t.ones_like(e)
-            adj_dense = adj.to_dense()
-            attention = t.where(adj_dense > 0, e, zero_vec)
-
-            # 2. 【关键】应用因果干预掩码（Do-operator）
-            if intervention_mask is not None:
-                # 将需要切断的连接（mask=0）设为 -1000（大负数）
-                # 这样 softmax 后这些位置的权重会变为接近 0
-                # 使用 -1000 而非 -inf 可以避免潜在的 NaN 问题
-                attention = t.where(
-                    intervention_mask > 0,  # mask=1 的位置保留
-                    attention,  # 保留原始注意力分数
-                    t.full_like(attention, -200.0)  # mask=0 的位置设为 -1000   -inf
-                )
-
-            # 3. 注意力归一化（-inf 会被 softmax 转为 0）
-            attention = F.softmax(attention, dim=1)
-            attention = F.dropout(attention, self.dropout, training=self.training)
-
-            # 4. 基于干预后的注意力聚合信息
-            h_prime = t.matmul(attention, Wh)
-            Whs.append(h_prime)
-
-        support = t.stack(Whs, dim=0)
-        output = t.stack([t.spmm(adj, sup) for sup in t.unbind(support, dim=0)], dim=0)
-        output = self.act(output)
-        return output
-
-
 # --- 新增：特征级门控拼接层 (Feature-wise Gated Concatenation) ---
 class GatedConcatFusion(nn.Module):
     def __init__(self, latdim):
@@ -148,19 +54,10 @@ class Model(nn.Module):
 
         if self.use_text_features:
             # 步骤 2: 加载预训练 LLM 嵌入
-            print("=" * 60)
-            print("🔄 加载预训练的LLM文本嵌入作为辅助特征...")
-            print("=" * 60)
-            print(f"📁 药物嵌入文件路径: {args.pretrained_drug_embed_path}")
-            print(f"📁 基因嵌入文件路径: {args.pretrained_gene_embed_path}")
-            
+            print("加载预训练的LLM文本嵌入作为辅助特征...")
             drug_embeds_text = t.from_numpy(np.load(args.pretrained_drug_embed_path)).float()
             gene_embeds_text = t.from_numpy(np.load(args.pretrained_gene_embed_path)).float()
 
-            print(f"✅ 药物嵌入加载成功: 形状 {drug_embeds_text.shape} (期望: [{args.drug}, *])")
-            print(f"✅ 基因嵌入加载成功: 形状 {gene_embeds_text.shape} (期望: [{args.gene}, *])")
-            print("=" * 60)
-            
             assert drug_embeds_text.shape[0] == args.drug, "Drug count mismatch"
             assert gene_embeds_text.shape[0] == args.gene, "Gene count mismatch"
 
@@ -192,44 +89,15 @@ class Model(nn.Module):
 
         self.edgeDropper = SpAdjDropEdge()
 
-        # 初始化因果图卷积层，用于捕获节点间的因果关系
-        self.causalGcnLayer = Causal_GraphConvolution(args.latdim, args.latdim)
-
-    def forward(self, adj, keepRate, intervention_mask=None):
-        """
-        前向传播（支持因果干预，不使用SE层）
-        
-        参数:
-        - adj: 邻接矩阵
-        - keepRate: dropout保留率
-        - intervention_mask: 因果干预掩码（可选）
-        """
+    def forward(self, adj, keepRate):
         # 步骤 3: GCN 传播 (结构视图)
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
-        gcnEmbedsLst = [struct_embeds]
-        causalEmbedsLst = [struct_embeds]
-        embeds_3d = t.unsqueeze(struct_embeds, 0)  # 在0维位置增加一个维度，用于因果GCN
 
-        # 因果干预在这里实现
-        for i in range(args.gnn_layer):
-            # 1. 普通图卷积传递
-            gcnEmbeds = self.gcnLayers[i](self.edgeDropper(adj, keepRate), embedsLst[-1])
-            gcnEmbedsLst.append(gcnEmbeds)
+        for gcn in self.gcnLayers:
+            struct_embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            embedsLst.append(struct_embeds)
 
-            # 2. 残差连接：将当前层输出与上一层输入相加
-            residual_embeds = t.add(gcnEmbeds, embedsLst[-1])
-
-            # 3. 因果感知的图卷积传递（应用干预掩码）
-            gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj, intervention_mask)  # 传入干预掩码
-            gcnEmbeds_c = gcnEmbeds_c.squeeze(0)  # 压缩维度
-            causalEmbedsLst.append(gcnEmbeds_c)
-
-            # 4. 特征融合：组合普通GCN和因果GCN的特征
-            fused_embeds = t.add(residual_embeds, gcnEmbeds_c)
-            embedsLst.append(fused_embeds)
-
-        # 5. 聚合所有层的特征
         final_struct_embeds = sum(embedsLst)
 
         all_text_feat = None
@@ -252,41 +120,15 @@ class Model(nn.Module):
         else:
             final_embeds = final_struct_embeds
 
-        return final_embeds, final_struct_embeds, all_text_feat, gcnEmbedsLst, causalEmbedsLst
+        return final_embeds,final_struct_embeds,all_text_feat
 
-    def forward_gcn(self, adj, intervention_mask=None):
-        """
-        用于推理或无 Dropout 的前向传播（支持因果干预，不使用SE层）
-        
-        参数:
-        - adj: 邻接矩阵
-        - intervention_mask: 因果干预掩码（可选，测试时通常不使用）
-        """
+    def forward_gcn(self, adj):
+        # 用于推理或无 Dropout 的前向传播
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
-        gcnEmbedsLst = [struct_embeds]
-        causalEmbedsLst = [struct_embeds]
-        embeds_3d = t.unsqueeze(struct_embeds, 0)  # 在0维位置增加一个维度
-
-        # 因果干预在这里实现
-        for i in range(args.gnn_layer):
-            # 1. 普通图卷积传递
-            gcnEmbeds = self.gcnLayers[i](adj, embedsLst[-1])
-            gcnEmbedsLst.append(gcnEmbeds)
-
-            # 2. 残差连接：将当前层输出与上一层输入相加
-            residual_embeds = t.add(gcnEmbeds, embedsLst[-1])
-
-            # 3. 因果感知的图卷积传递（应用干预掩码）
-            gcnEmbeds_c = self.causalGcnLayer(embeds_3d, adj, intervention_mask)
-            gcnEmbeds_c = gcnEmbeds_c.squeeze(0)
-            causalEmbedsLst.append(gcnEmbeds_c)
-
-            # 4. 特征融合：组合普通GCN和因果GCN的特征
-            fused_embeds = t.add(residual_embeds, gcnEmbeds_c)
-            embedsLst.append(fused_embeds)
-
-        # 5. 聚合所有层的特征
+        for gcn in self.gcnLayers:
+            embeds = gcn(adj, embedsLst[-1])
+            embedsLst.append(embeds)
         final_struct_embeds = sum(embedsLst)
 
         if self.use_text_features:
@@ -303,64 +145,31 @@ class Model(nn.Module):
 
         return final_embeds[:args.drug], final_embeds[args.drug:]
 
-    def calcLosses(self, drugs, genes, labels, adj, keepRate, intervention_mask=None):
-        """
-        计算损失（支持因果干预）
-        
-        参数:
-        - drugs: 药物索引
-        - genes: 基因索引
-        - labels: 标签
-        - adj: 邻接矩阵
-        - keepRate: dropout保留率
-        - intervention_mask: 因果干预掩码（可选）
-        """
-        # 获取模型输出（传入干预掩码）
-        embeds, struct_view, text_view, gcnEmbedsLst, causalEmbedsLst = self.forward(adj, keepRate, intervention_mask)
+    def calcLosses(self, drugs, genes, labels, adj, keepRate):
+        embeds,struct_view,text_view = self.forward(adj, keepRate)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
-        # 选择相关的药物和基因嵌入
         dEmbeds = dEmbeds[drugs]
         gEmbeds = gEmbeds[genes]
 
-        # 计算交叉熵损失
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
+        sslLoss=0
+        # 没有用
+        # if self.use_text_features:
+        #     alpha = 0.0000001
+        #     sslLoss = contrastLoss(struct_view[drugs], text_view[drugs],args.temp) + \
+        #               contrastLoss(struct_view[genes], text_view[genes],args.temp)
+        #     sslLoss = sslLoss*alpha
+        return ceLoss, sslLoss
 
-        # 计算自监督对比学习损失
-        # 使用普通GCN和因果GCN的输出进行对比学习
-        sslLoss = 0
-        for i in range(1, args.gnn_layer + 1, 1):
-            # 获取普通GCN的特征（作为锚点）
-            embeds1 = gcnEmbedsLst[i].detach()
-            # 获取因果GCN的特征（作为正样本）
-            embeds2 = causalEmbedsLst[i]
-
-            # 分别计算药物和基因的对比损失
-            # sslLoss += contrastLoss(embeds1[:args.drug], embeds2[:args.drug], t.unique(drugs),
-            #                         args.temp) + contrastLoss(
-            #     embeds1[args.drug:], embeds2[args.drug:], t.unique(genes), args.temp)
-
-        return ceLoss, 0
-
-    def predict(self, adj, drugs, genes, intervention_mask=None):
-        """
-        预测（支持因果干预）
-        
-        参数:
-        - adj: 邻接矩阵
-        - drugs: 药物索引
-        - genes: 基因索引
-        - intervention_mask: 因果干预掩码（可选，测试时通常不使用）
-        """
-        embeds, _, _, _, _ = self.forward(adj, 1.0, intervention_mask)
+    def predict(self, adj, drugs, genes):
+        embeds,_,_ = self.forward(adj, 1.0)
         dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
 
-        # Select drug and gene embeddings based on input indices
         dEmbeds = dEmbeds[drugs]
         gEmbeds = gEmbeds[genes]
 
-        # Perform classification
         pre = self.classifierLayer(dEmbeds, gEmbeds)
         return pre
 
