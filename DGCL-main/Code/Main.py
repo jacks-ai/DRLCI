@@ -49,47 +49,95 @@ def set_seed(seed):
 
 
 # Function to log all error cases from all iterations
-def log_all_error_cases(all_iteration_errors, log_file):
+def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
     """
-    将所有iteration的错误案例格式化输出到日志
+    将所有iteration的错误案例导出为CSV文件，并在日志中记录统计信息
     
     参数:
     all_iteration_errors: 列表，每个元素包含一个iteration的错误信息
     log_file: 已打开的日志文件对象
+    log_filepath: 日志文件路径（用于生成CSV文件路径）
     """
+    import csv
+    
+    # 生成CSV文件路径（与日志文件同目录，同名但扩展名为.csv）
+    csv_filepath = log_filepath.replace('.txt', '_error_cases.csv')
+    
+    # 统计信息
+    total_errors = sum(len(iter_info['error_cases']) for iter_info in all_iteration_errors)
+    avg_errors = total_errors / len(all_iteration_errors) if all_iteration_errors else 0
+    
+    # 写入CSV文件
+    try:
+        with open(csv_filepath, 'w', newline='', encoding='utf-8') as csvfile:
+            csv_writer = csv.writer(csvfile)
+            
+            # 写入CSV表头
+            csv_writer.writerow(['Iteration', 'Best_Epoch', 'Best_ACC', '药物ID', '基因ID', '预测标签', '真实标签'])
+            
+            # 遍历每个iteration
+            for iter_info in all_iteration_errors:
+                iteration = iter_info['iteration']
+                best_epoch = iter_info['best_epoch']
+                best_acc = iter_info['best_acc']
+                error_cases = iter_info['error_cases']
+                
+                if len(error_cases) > 0:
+                    # 写入该iteration的所有错误案例
+                    for case in error_cases:
+                        csv_writer.writerow([
+                            iteration,
+                            best_epoch,
+                            f"{best_acc:.4f}",
+                            case['drug'],
+                            case['gene'],
+                            case['predicted'],
+                            case['actual']
+                        ])
+                else:
+                    # 如果没有错误案例，写入一行说明
+                    csv_writer.writerow([
+                        iteration,
+                        best_epoch,
+                        f"{best_acc:.4f}",
+                        'N/A',
+                        'N/A',
+                        'N/A',
+                        'N/A'
+                    ])
+                
+                # 在每个iteration后添加空行（用于分隔）
+                csv_writer.writerow([])
+        
+        print(f"✅ 错误案例已导出到CSV文件: {csv_filepath}")
+        
+    except Exception as e:
+        print(f"❌ 导出CSV文件失败: {e}")
+        csv_filepath = None
+    
+    # 在日志文件中记录统计信息
     error_log = [
         "\n" + "=" * 60,
         "🔍 错误案例分析（每个Iteration的最佳Epoch）",
         "=" * 60 + "\n"
     ]
     
+    # 添加CSV文件路径信息
+    if csv_filepath:
+        error_log.append(f"📄 详细错误案例已导出到CSV文件:")
+        error_log.append(f"   {csv_filepath}\n")
+    
+    # 为每个iteration添加简要统计
     for iter_info in all_iteration_errors:
         iteration = iter_info['iteration']
         best_epoch = iter_info['best_epoch']
         best_acc = iter_info['best_acc']
         error_cases = iter_info['error_cases']
         
-        error_log.append(f"\n{'=' * 60}")
-        error_log.append(f"Iteration {iteration} - Best Epoch: {best_epoch} - ACC: {best_acc:.4f}")
-        error_log.append(f"{'=' * 60}")
-        error_log.append(f"错误案例数: {len(error_cases)}")
-        
-        if len(error_cases) > 0:
-            error_log.append("\n药物ID\t基因ID\t预测标签\t真实标签")
-            error_log.append("-" * 60)
-            
-            for case in error_cases:
-                error_log.append(
-                    f"{case['drug']}\t{case['gene']}\t"
-                    f"{case['predicted']}\t{case['actual']}"
-                )
-        else:
-            error_log.append("✅ 无错误案例（完美预测）")
+        error_log.append(f"\nIteration {iteration} - Best Epoch: {best_epoch} - ACC: {best_acc:.4f}")
+        error_log.append(f"  错误案例数: {len(error_cases)}")
     
-    # 统计信息
-    total_errors = sum(len(iter_info['error_cases']) for iter_info in all_iteration_errors)
-    avg_errors = total_errors / len(all_iteration_errors) if all_iteration_errors else 0
-    
+    # 总体统计信息
     error_log.append(f"\n{'=' * 60}")
     error_log.append("📊 总体统计")
     error_log.append(f"{'=' * 60}")
@@ -333,6 +381,7 @@ class Coach:
         if reses['Acc'] > best_acc_in_iteration:
             best_acc_in_iteration = reses['Acc']
             best_errors_in_iteration = final_error_cases
+
 
         self.save_model('{}'.format(config['iteration']))
 
@@ -1812,6 +1861,9 @@ if __name__ == '__main__':
 
 
     save_results_to_log(overall_iteration_best, coach)
+    
+    # 输出错误案例到日志和CSV文件
+    log_all_error_cases(all_iteration_errors, log_file, log_filepath)
 
     log_file.close()
     print(f"📝 日志文件已关闭: {log_filepath}")
