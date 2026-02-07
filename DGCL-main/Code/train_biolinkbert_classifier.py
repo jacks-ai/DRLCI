@@ -18,19 +18,60 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 import time
 from datetime import datetime
 from torch.amp import autocast, GradScaler  # FP16 混合精度训练 (修复FutureWarning)
+import argparse
+
+# ==================== 解析命令行参数 ====================
+# 策略：先提取我们的参数，然后从 sys.argv 中移除，再导入 DataHandler
+# 这样 DataHandler -> Params.py 就不会看到 --learning_rate 参数
+
+def parse_and_extract_custom_args():
+    """
+    提取自定义参数（learning_rate, data, gpu），并从 sys.argv 中移除
+    这样后续导入的 Params.py 就不会报错
+    """
+    learning_rate = 4e-5  # 默认值
+    data = 'DGIdb'  # 默认数据集
+    gpu = 0  # 默认GPU
+    
+    # 解析并移除自定义参数
+    new_argv = [sys.argv[0]]  # 保留脚本名
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '--learning_rate' and i + 1 < len(sys.argv):
+            learning_rate = float(sys.argv[i + 1])
+            i += 2  # 跳过参数名和值
+        elif sys.argv[i] == '--data' and i + 1 < len(sys.argv):
+            data = sys.argv[i + 1]
+            new_argv.extend([sys.argv[i], sys.argv[i + 1]])  # 保留 --data 给 Params.py
+            i += 2
+        elif sys.argv[i] == '--gpu' and i + 1 < len(sys.argv):
+            gpu = int(sys.argv[i + 1])
+            new_argv.extend([sys.argv[i], sys.argv[i + 1]])  # 保留 --gpu 给 Params.py
+            i += 2
+        else:
+            new_argv.append(sys.argv[i])
+            i += 1
+    
+    # 更新 sys.argv
+    sys.argv = new_argv
+    
+    return learning_rate, data, gpu
+
+# 提取参数（在导入 DataHandler 之前）
+CUSTOM_LEARNING_RATE, DATASET_NAME, GPU_ID = parse_and_extract_custom_args()
 
 # 添加项目路径
 CODE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CODE_DIR.parent
 sys.path.append(str(CODE_DIR))
 
-from Params import args
+# 现在可以安全导入 DataHandler（它会导入 Params，但 sys.argv 中已经没有 --learning_rate 了）
 from DataHandler import DataHandler
 
 # ==================== 路径配置 ====================
 timestamp = datetime.now().strftime("%m%d_%H%M%S")
 save_path = CODE_DIR / f'bert/best_biolinkbert_classifier_{timestamp}.pt'
-DATA_ROOT = PROJECT_ROOT / 'Data' / args.data
+DATA_ROOT = PROJECT_ROOT / 'Data' / DATASET_NAME
 MODEL_CACHE = Path(r"/mnt/data/huangpeng/DGCL/mymodel/BioLinkBERT")
 ERROR_CASES_CSV = "/mnt/data/huangpeng/DGCL/DGCL-main/log/0204_233151_DGIdb_error_cases.csv"  # 已注释，改用DataHandler加载测试集
 DRUG_DESC_CSV = DATA_ROOT / 'drug_text' / 'mixed_drug_descriptions.csv'
@@ -47,9 +88,10 @@ LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
 # 2. BERT模型显存占用大，batch_size需要更小 (16 vs 4096)
 # 3. 预训练模型收敛快，不需要450个epoch (5-10 vs 450)
 # 4. BERT微调使用AdamW + warmup，而GNN使用普通Adam
+
 TRAIN_CONFIG = {
     'batch_size': 16,              # FP16开启后可增大到 24-32
-    'learning_rate': 2e-5,         # BERT微调推荐: 2e-5 ~ 5e-5
+    'learning_rate': CUSTOM_LEARNING_RATE,  # 从命令行参数读取 (已在文件开头解析)
     'num_epochs': 10,              # BERT微调推荐: 3-10 epochs
     'warmup_ratio': 0.1,           # 预热10%的训练步数
     'max_grad_norm': 1.0,          # 梯度裁剪 (BERT标准: 1.0)
@@ -57,7 +99,7 @@ TRAIN_CONFIG = {
     'save_steps': 500,             # 每500步保存一次
     'eval_steps': 500,             # 每500步评估一次
     'fp16': True,                  # V100 必开！提速 2-3 倍，节省 50% 显存
-    'max_length': 256,             # 最大序列长度（联合编码需要更长）
+    'max_length': 512,             # 最大序列长度（联合编码需要更长）
     
     # 负采样配置（已禁用）
     'num_neg_samples': 0,         # 不使用负采样
@@ -65,8 +107,12 @@ TRAIN_CONFIG = {
     'contrastive_weight': 0.0,     # 对比损失权重（已禁用）
 }
 
-# Prompt模板（联合编码）
-PROMPT_TEMPLATE = "[CLS] Drug: {drug_desc} [SEP] Gene: {gene_desc} [SEP]"
+# Prompt模板（句子对编码）
+# 注意：使用 tokenizer(text, text_pair) 时，tokenizer会自动添加 [CLS] 和 [SEP]
+# 实际生成: [CLS] Drug: {drug_desc} [SEP] Gene: {gene_desc} [SEP]
+# token_type_ids: [0, 0, ..., 0, 1, 1, ..., 1]
+PROMPT_TEMPLATE_TEXT = "Drug: {drug_desc}"
+PROMPT_TEMPLATE_TEXT_PAIR = "Gene: {gene_desc}"
 
 # 14种交互类型
 INTERACTION_TYPES = [
@@ -115,19 +161,24 @@ class BioLinkBERTClassifier(nn.Module):
         # 使用联合编码的分类器
         self.classifier = ClassifierLayer(input_dim=hidden_dim, num_classes=num_classes)
     
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
         """
         联合编码drug和gene，提取[CLS] token送入分类器
         
         Args:
             input_ids: [batch_size, seq_len] - 联合编码的token IDs
             attention_mask: [batch_size, seq_len] - 注意力掩码
+            token_type_ids: [batch_size, seq_len] - 句子类型ID (0=句子A/药物, 1=句子B/基因)
         
         Returns:
             logits: [batch_size, num_classes]
         """
-        # 联合编码
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # 联合编码（使用token_type_ids区分药物和基因）
+        outputs = self.bert(
+            input_ids=input_ids, 
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
         cls_embed = outputs.last_hidden_state[:, 0, :]  # [batch_size, 1024]
         
         # 通过分类器
@@ -166,15 +217,15 @@ class DrugGeneDataset(Dataset):
         gene_id = self.gene_ids_global[gene_idx]
         
         # 获取描述文本
-        drug_desc = self.drug_descriptions.get(drug_id, f"Drug {drug_id}")[:200]
-        gene_desc = self.gene_descriptions.get(gene_id, f"Gene {gene_id}")[:200]
+        drug_desc = self.drug_descriptions.get(drug_id, f"Drug {drug_id}")[:292]
+        gene_desc = self.gene_descriptions.get(gene_id, f"Gene {gene_id}")[:220]
         
-        # 构建联合prompt
-        joint_prompt = f"[CLS] Drug: {drug_desc} [SEP] Gene: {gene_desc} [SEP]"
-        
-        # Tokenize
+        # 使用 text 和 text_pair 进行正确的句子对编码
+        # tokenizer会自动添加 [CLS] text [SEP] text_pair [SEP]
+        # 并自动生成 token_type_ids: [0, 0, ..., 0, 1, 1, ..., 1]
         encoding = self.tokenizer(
-            joint_prompt,
+            text=f"Drug: {drug_desc}",
+            text_pair=f"Gene: {gene_desc}",
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
@@ -184,6 +235,7 @@ class DrugGeneDataset(Dataset):
         result = {
             'input_ids': encoding['input_ids'].squeeze(0),
             'attention_mask': encoding['attention_mask'].squeeze(0),
+            'token_type_ids': encoding['token_type_ids'].squeeze(0),
             'label': torch.tensor(label, dtype=torch.long)
         }
         
@@ -215,7 +267,7 @@ def load_training_and_test_data():
     使用DataHandler加载训练数据和测试数据
     返回: (train_drugs, train_genes, train_labels, test_drugs, test_genes, test_labels)
     """
-    print(f"\n[加载数据] 数据集: {args.data}")
+    print(f"\n[加载数据] 数据集: {DATASET_NAME}")
     
     # 初始化DataHandler
     handler = DataHandler()
@@ -297,6 +349,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
         # 移动到设备
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
+        token_type_ids = batch['token_type_ids'].to(device)
         labels = batch['label'].to(device)
         
         optimizer.zero_grad()
@@ -304,7 +357,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
         # FP16 混合精度训练
         if use_fp16:
             with autocast('cuda'):
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids, attention_mask, token_type_ids)
                 loss = F.cross_entropy(logits, labels)
             
             # 反向传播 (FP16)
@@ -315,7 +368,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
             scaler.update()
         else:
             # 标准 FP32 训练
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, attention_mask, token_type_ids)
             loss = F.cross_entropy(logits, labels)
             
             # 反向传播 (FP32)
@@ -351,9 +404,10 @@ def evaluate(model, dataloader, device):
         for batch in tqdm(dataloader, desc="Evaluating"):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
+            token_type_ids = batch['token_type_ids'].to(device)
             labels = batch['label'].to(device)
             
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, attention_mask, token_type_ids)
             probs = F.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
             
@@ -376,19 +430,18 @@ def main():
     log_and_print("=" * 80, LOG_FILE)
     log_and_print("BioLinkBERT + MLP 分类器训练", LOG_FILE)
     log_and_print("=" * 80, LOG_FILE)
-    log_and_print(f"数据集: {args.data}", LOG_FILE)
+    log_and_print(f"数据集: {DATASET_NAME}", LOG_FILE)
     log_and_print(f"训练配置: {TRAIN_CONFIG}", LOG_FILE)
     log_and_print(f"日志文件: {LOG_FILE}", LOG_FILE)
     log_and_print("=" * 80, LOG_FILE)
     
     # 设置设备（支持指定GPU）
     if torch.cuda.is_available():
-        # 从 Params.py 读取 GPU 配置
-        gpu_id = args.gpu if hasattr(args, 'gpu') else 0
-        device = torch.device(f'cuda:{gpu_id}')
+        # 使用脚本参数指定的 GPU
+        device = torch.device(f'cuda:{GPU_ID}')
         torch.cuda.set_device(device)
-        log_and_print(f"\n设备: {device} ({torch.cuda.get_device_name(gpu_id)})", LOG_FILE)
-        log_and_print(f"显存: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB", LOG_FILE)
+        log_and_print(f"\n设备: {device} ({torch.cuda.get_device_name(GPU_ID)})", LOG_FILE)
+        log_and_print(f"显存: {torch.cuda.get_device_properties(GPU_ID).total_memory / 1024**3:.1f} GB", LOG_FILE)
     else:
         device = torch.device('cpu')
         log_and_print(f"\n设备: CPU (CUDA不可用)", LOG_FILE)
@@ -488,9 +541,9 @@ def main():
     error_cases_acc_history = []
     
     for epoch in range(1, TRAIN_CONFIG['num_epochs'] + 1):
-        log_and_print(f"\n{'='*60}", LOG_FILE)
-        log_and_print(f"Epoch {epoch}/{TRAIN_CONFIG['num_epochs']}", LOG_FILE)
-        log_and_print(f"{'='*60}", LOG_FILE)
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch}/{TRAIN_CONFIG['num_epochs']}")
+        print(f"{'='*60}")
         
         epoch_start_time = time.time()
         
@@ -500,22 +553,22 @@ def main():
         )
         epoch_time = time.time() - epoch_start_time
         
-        log_and_print(f"  训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s", LOG_FILE)
-        
+        print(f"  训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s")
+
         # 在官方测试集上评估
         test_acc, test_top5_acc, test_preds, test_labels_eval = evaluate(model, test_loader, device)
-        log_and_print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}", LOG_FILE)
+        print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}")
         official_test_acc_history.append(test_acc)
         
         # 在错误案例上评估
         error_acc, error_top5_acc, error_preds, error_labels_eval = evaluate(model, error_loader, device)
-        log_and_print(f"  错误案例集 - Accuracy: {error_acc:.4f}, Top-5 Accuracy: {error_top5_acc:.4f}", LOG_FILE)
+        print(f"  错误案例集 - Accuracy: {error_acc:.4f}, Top-5 Accuracy: {error_top5_acc:.4f}")
         error_cases_acc_history.append(error_acc)
         
-        # 保存最佳模型（基于官方测试集）
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
-            best_error_acc = error_acc  # 记录此时错误案例的准确率
+        # 保存最佳模型（基于错误案例集）
+        if error_acc > best_error_acc:
+            best_error_acc = error_acc
+            best_test_acc = test_acc  # 记录此时官方测试集的准确率
             save_path = CODE_DIR / f'bert/best_biolinkbert_classifier_{timestamp}.pt'
             torch.save({
                 'epoch': epoch,
@@ -527,7 +580,8 @@ def main():
                 'error_top5_acc': error_top5_acc,
                 'config': TRAIN_CONFIG,
             }, save_path)
-            log_and_print(f"  ✓ 保存最佳模型: {save_path}", LOG_FILE)
+            print(f"  ✓ 保存最佳模型 (基于错误案例集): {save_path}")
+            log_and_print(f"Epoch {epoch}: 保存最佳模型 (error_acc={error_acc:.4f}, test_acc={test_acc:.4f})", LOG_FILE)
     
     total_training_time = time.time() - training_start_time
     log_and_print(f"\n总训练时间: {total_training_time/60:.1f} 分钟", LOG_FILE)
@@ -542,9 +596,9 @@ def main():
     best_official_epoch = np.argmax(official_test_acc_history) + 1  # +1 因为epoch从1开始
     best_error_epoch = np.argmax(error_cases_acc_history) + 1
     
-    log_and_print(f"最佳官方测试准确率: {best_test_acc:.4f} (Epoch {best_official_epoch})", LOG_FILE)
-    log_and_print(f"对应的错误案例准确率: {best_error_acc:.4f}", LOG_FILE)
-    log_and_print(f"\n错误案例集最佳准确率: {max(error_cases_acc_history):.4f} (Epoch {best_error_epoch})", LOG_FILE)
+    log_and_print(f"最佳错误案例准确率: {best_error_acc:.4f} (Epoch {best_error_epoch}) ← 已保存", LOG_FILE)
+    log_and_print(f"对应的官方测试准确率: {best_test_acc:.4f}", LOG_FILE)
+    log_and_print(f"\n官方测试集最佳准确率: {max(official_test_acc_history):.4f} (Epoch {best_official_epoch})", LOG_FILE)
     
     # 输出每个epoch的准确率历史
     log_and_print(f"\n{'='*80}", LOG_FILE)

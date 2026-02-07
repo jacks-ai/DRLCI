@@ -1666,6 +1666,11 @@ if __name__ == '__main__':
     overall_iteration_best = {met: [] for met in coach.metrics_to_track}
     best_epochs_per_metric = {met: [] for met in coach.metrics_to_track}
     all_iteration_errors = []  # 新增：存储每个iteration的错误案例
+    
+    # 新增：全局最佳模型跟踪
+    global_best_acc = 0.0
+    global_best_iteration = -1
+    global_best_model_state = None
 
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
@@ -1711,6 +1716,17 @@ if __name__ == '__main__':
         if not np.isnan(aucMax) and aucMax > it_max:
             it_max = aucMax
             print(f"🎯 New best result updated: {it_max} at iteration {i + 1}")
+        
+        # 新增：跟踪全局最佳模型（用于保存）
+        if not np.isnan(best_acc) and best_acc > 0.948 and best_acc > global_best_acc:
+            global_best_acc = best_acc
+            global_best_iteration = i + 1
+            # 保存当前最佳模型的状态字典
+            if coach.is_data_parallel:
+                global_best_model_state = deepcopy(coach.model.module.state_dict())
+            else:
+                global_best_model_state = deepcopy(coach.model.state_dict())
+            print(f"🏆 New global best model: ACC={best_acc:.4f} at iteration {i + 1}, epoch {best_epoch}")
 
     plt.plot(iteration_list, end_acc_list)
     plt.ylabel('accuracy')
@@ -1861,6 +1877,53 @@ if __name__ == '__main__':
 
 
     save_results_to_log(overall_iteration_best, coach)
+    
+    # 新增：保存全局最佳模型
+    if global_best_model_state is not None and global_best_acc > 0.948:
+        gcn_model_dir = "/mnt/data/huangpeng/DGCL/DGCL-main/Code/GCN"
+        os.makedirs(gcn_model_dir, exist_ok=True)
+        
+        model_filename = f"{args.data}_best_iter{global_best_iteration}_acc{global_best_acc:.4f}.pkl"
+        model_save_path = os.path.join(gcn_model_dir, model_filename)
+        
+        try:
+            t.save(global_best_model_state, model_save_path)
+            save_msg = (
+                f"\n{'=' * 60}\n"
+                f"💾 全局最佳GCN模型已保存\n"
+                f"{'=' * 60}\n"
+                f"📁 保存路径: {model_save_path}\n"
+                f"🎯 准确率: {global_best_acc:.4f} ({global_best_acc * 100:.2f}%)\n"
+                f"🔢 Iteration: {global_best_iteration}\n"
+                f"📊 数据集: {args.data}\n"
+                f"{'=' * 60}\n"
+            )
+            print(save_msg)
+            log_file_handle = open(log_filepath, 'a', encoding='utf-8')
+            log_file_handle.write(save_msg)
+            log_file_handle.close()
+        except Exception as e:
+            error_msg = f"❌ 保存模型失败: {e}\n"
+            print(error_msg)
+            log_file_handle = open(log_filepath, 'a', encoding='utf-8')
+            log_file_handle.write(error_msg)
+            log_file_handle.close()
+    else:
+        no_save_msg = (
+            f"\n{'=' * 60}\n"
+            f"ℹ️  未保存模型\n"
+            f"{'=' * 60}\n"
+            f"原因: "
+        )
+        if global_best_model_state is None:
+            no_save_msg += "没有找到有效的最佳模型\n"
+        elif global_best_acc <= 0.948:
+            no_save_msg += f"最佳准确率 {global_best_acc:.4f} 未达到阈值 0.948\n"
+        no_save_msg += f"{'=' * 60}\n"
+        print(no_save_msg)
+        log_file_handle = open(log_filepath, 'a', encoding='utf-8')
+        log_file_handle.write(no_save_msg)
+        log_file_handle.close()
     
     # 输出错误案例到日志和CSV文件
     log_all_error_cases(all_iteration_errors, log_file, log_filepath)
