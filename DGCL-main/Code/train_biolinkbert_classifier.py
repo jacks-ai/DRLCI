@@ -36,6 +36,9 @@ ERROR_CASES_CSV = "/mnt/data/huangpeng/DGCL/DGCL-main/log/0204_233151_DGIdb_erro
 DRUG_DESC_CSV = DATA_ROOT / 'drug_text' / 'mixed_drug_descriptions.csv'
 GENE_DESC_JSON = DATA_ROOT / 'gene_text' / 'gene_embeddings_txt.json'
 GLOBAL_IDS_JSON = DATA_ROOT / 'global_ids.json'
+LOG_DIR = Path("/mnt/data/huangpeng/DGCL/DGCL-main/Code/bert/blog")  # 日志目录
+LOG_DIR.mkdir(parents=True, exist_ok=True)  # 确保目录存在
+LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
 
 # ==================== 超参数配置 ====================
 # 注意：这些超参与Params.py中的GNN超参不同
@@ -45,7 +48,7 @@ GLOBAL_IDS_JSON = DATA_ROOT / 'global_ids.json'
 # 3. 预训练模型收敛快，不需要450个epoch (5-10 vs 450)
 # 4. BERT微调使用AdamW + warmup，而GNN使用普通Adam
 TRAIN_CONFIG = {
-    'batch_size': 32,              # FP16开启后可增大到 24-32
+    'batch_size': 16,              # FP16开启后可增大到 24-32
     'learning_rate': 2e-5,         # BERT微调推荐: 2e-5 ~ 5e-5
     'num_epochs': 10,              # BERT微调推荐: 3-10 epochs
     'warmup_ratio': 0.1,           # 预热10%的训练步数
@@ -54,7 +57,7 @@ TRAIN_CONFIG = {
     'save_steps': 500,             # 每500步保存一次
     'eval_steps': 500,             # 每500步评估一次
     'fp16': True,                  # V100 必开！提速 2-3 倍，节省 50% 显存
-    'max_length': 512,             # 最大序列长度（联合编码需要更长）
+    'max_length': 256,             # 最大序列长度（联合编码需要更长）
     
     # 负采样配置（已禁用）
     'num_neg_samples': 0,         # 不使用负采样
@@ -71,6 +74,15 @@ INTERACTION_TYPES = [
     "Potentiator", "Cofactor", "Ligand", "Inhibitor", "Activator",
     "Partial agonist", "Positive modulator", "Allosteric modulator"
 ]
+
+
+# ==================== 日志工具函数 ====================
+def log_and_print(message, log_file=None):
+    """同时输出到控制台和日志文件"""
+    print(message)
+    if log_file:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(message + '\n')
 
 
 # ==================== 模型定义 ====================
@@ -361,12 +373,13 @@ def evaluate(model, dataloader, device):
 
 # ==================== 主函数 ====================
 def main():
-    print("=" * 80)
-    print("BioLinkBERT + MLP 分类器训练")
-    print("=" * 80)
-    print(f"数据集: {args.data}")
-    print(f"训练配置: {TRAIN_CONFIG}")
-    print("=" * 80)
+    log_and_print("=" * 80, LOG_FILE)
+    log_and_print("BioLinkBERT + MLP 分类器训练", LOG_FILE)
+    log_and_print("=" * 80, LOG_FILE)
+    log_and_print(f"数据集: {args.data}", LOG_FILE)
+    log_and_print(f"训练配置: {TRAIN_CONFIG}", LOG_FILE)
+    log_and_print(f"日志文件: {LOG_FILE}", LOG_FILE)
+    log_and_print("=" * 80, LOG_FILE)
     
     # 设置设备（支持指定GPU）
     if torch.cuda.is_available():
@@ -374,38 +387,38 @@ def main():
         gpu_id = args.gpu if hasattr(args, 'gpu') else 0
         device = torch.device(f'cuda:{gpu_id}')
         torch.cuda.set_device(device)
-        print(f"\n设备: {device} ({torch.cuda.get_device_name(gpu_id)})")
-        print(f"显存: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB")
+        log_and_print(f"\n设备: {device} ({torch.cuda.get_device_name(gpu_id)})", LOG_FILE)
+        log_and_print(f"显存: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB", LOG_FILE)
     else:
         device = torch.device('cpu')
-        print(f"\n设备: CPU (CUDA不可用)")
+        log_and_print(f"\n设备: CPU (CUDA不可用)", LOG_FILE)
     
     # 1. 加载全局数据
-    print("\n[1/9] 加载全局数据...")
+    log_and_print("\n[1/9] 加载全局数据...", LOG_FILE)
     drug_ids_global, gene_ids_global = load_global_ids()
     drug_descriptions = load_drug_descriptions()
     gene_descriptions = load_gene_descriptions()
-    print(f"  ✓ 药物数: {len(drug_ids_global)}, 基因数: {len(gene_ids_global)}")
+    log_and_print(f"  ✓ 药物数: {len(drug_ids_global)}, 基因数: {len(gene_ids_global)}", LOG_FILE)
     
     # 2. 加载训练数据和测试数据
-    print("\n[2/9] 加载训练数据和测试数据...")
+    log_and_print("\n[2/9] 加载训练数据和测试数据...", LOG_FILE)
     train_drugs, train_genes, train_labels, test_drugs, test_genes, test_labels = load_training_and_test_data()
     
     # 2.5 加载错误案例测试集
-    print("\n[2.5/9] 加载错误案例测试集...")
+    log_and_print("\n[2.5/9] 加载错误案例测试集...", LOG_FILE)
     error_drugs, error_genes, error_labels = load_test_data_from_error_cases(drug_ids_global, gene_ids_global)
     
     # 3. 加载模型和tokenizer
-    print("\n[3/9] 加载BioLinkBERT模型...")
+    log_and_print("\n[3/9] 加载BioLinkBERT模型...", LOG_FILE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_CACHE, local_files_only=True, trust_remote_code=True)
     bert_model = AutoModel.from_pretrained(MODEL_CACHE, local_files_only=True, trust_remote_code=True)
     
     model = BioLinkBERTClassifier(bert_model, num_classes=14)
     model = model.to(device)
-    print(f"  ✓ 模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    log_and_print(f"  ✓ 模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", LOG_FILE)
     
     # 4. 创建数据集和数据加载器
-    print("\n[4/9] 创建数据加载器...")
+    log_and_print("\n[4/9] 创建数据加载器...", LOG_FILE)
     
     max_length = TRAIN_CONFIG['max_length']
     
@@ -434,14 +447,14 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=TRAIN_CONFIG['batch_size'], shuffle=False)
     error_loader = DataLoader(error_dataset, batch_size=TRAIN_CONFIG['batch_size'], shuffle=False)
     
-    print(f"  ✓ 训练批次数: {len(train_loader)}")
-    print(f"  ✓ 官方测试批次数: {len(test_loader)}")
-    print(f"  ✓ 错误案例批次数: {len(error_loader)}")
-    print(f"  ✓ 编码方式: 联合编码 (Drug + Gene)")
-    print(f"  ✓ 最大序列长度: {max_length}")
+    log_and_print(f"  ✓ 训练批次数: {len(train_loader)}", LOG_FILE)
+    log_and_print(f"  ✓ 官方测试批次数: {len(test_loader)}", LOG_FILE)
+    log_and_print(f"  ✓ 错误案例批次数: {len(error_loader)}", LOG_FILE)
+    log_and_print(f"  ✓ 编码方式: 联合编码 (Drug + Gene)", LOG_FILE)
+    log_and_print(f"  ✓ 最大序列长度: {max_length}", LOG_FILE)
     
     # 5. 设置优化器和学习率调度器
-    print("\n[5/9] 设置优化器...")
+    log_and_print("\n[5/9] 设置优化器...", LOG_FILE)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=TRAIN_CONFIG['learning_rate'],
@@ -457,14 +470,14 @@ def main():
     if TRAIN_CONFIG['fp16']:
         if torch.cuda.is_available():
             scaler = GradScaler(device='cuda')  # 使用 device 参数
-            print(f"  ✓ FP16 混合精度训练已启用 (预期提速 2-3x)")
+            log_and_print(f"  ✓ FP16 混合精度训练已启用 (预期提速 2-3x)", LOG_FILE)
         else:
-            print(f"  ⚠ FP16 需要 CUDA，已自动切换到 FP32")
+            log_and_print(f"  ⚠ FP16 需要 CUDA，已自动切换到 FP32", LOG_FILE)
     
-    print(f"  ✓ 总训练步数: {total_steps}, 预热步数: {warmup_steps}")
+    log_and_print(f"  ✓ 总训练步数: {total_steps}, 预热步数: {warmup_steps}", LOG_FILE)
     
     # 6. 训练循环
-    print("\n[6/9] 开始训练...")
+    log_and_print("\n[6/9] 开始训练...", LOG_FILE)
     best_test_acc = 0.0
     best_error_acc = 0.0
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
@@ -475,9 +488,9 @@ def main():
     error_cases_acc_history = []
     
     for epoch in range(1, TRAIN_CONFIG['num_epochs'] + 1):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch}/{TRAIN_CONFIG['num_epochs']}")
-        print(f"{'='*60}")
+        log_and_print(f"\n{'='*60}", LOG_FILE)
+        log_and_print(f"Epoch {epoch}/{TRAIN_CONFIG['num_epochs']}", LOG_FILE)
+        log_and_print(f"{'='*60}", LOG_FILE)
         
         epoch_start_time = time.time()
         
@@ -487,16 +500,16 @@ def main():
         )
         epoch_time = time.time() - epoch_start_time
         
-        print(f"  训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s")
+        log_and_print(f"  训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s", LOG_FILE)
         
         # 在官方测试集上评估
         test_acc, test_top5_acc, test_preds, test_labels_eval = evaluate(model, test_loader, device)
-        print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}")
+        log_and_print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}", LOG_FILE)
         official_test_acc_history.append(test_acc)
         
         # 在错误案例上评估
         error_acc, error_top5_acc, error_preds, error_labels_eval = evaluate(model, error_loader, device)
-        print(f"  错误案例集 - Accuracy: {error_acc:.4f}, Top-5 Accuracy: {error_top5_acc:.4f}")
+        log_and_print(f"  错误案例集 - Accuracy: {error_acc:.4f}, Top-5 Accuracy: {error_top5_acc:.4f}", LOG_FILE)
         error_cases_acc_history.append(error_acc)
         
         # 保存最佳模型（基于官方测试集）
@@ -514,34 +527,34 @@ def main():
                 'error_top5_acc': error_top5_acc,
                 'config': TRAIN_CONFIG,
             }, save_path)
-            print(f"  ✓ 保存最佳模型: {save_path}")
+            log_and_print(f"  ✓ 保存最佳模型: {save_path}", LOG_FILE)
     
     total_training_time = time.time() - training_start_time
-    print(f"\n总训练时间: {total_training_time/60:.1f} 分钟")
+    log_and_print(f"\n总训练时间: {total_training_time/60:.1f} 分钟", LOG_FILE)
     
     # 7. 最终评估
-    print("\n[7/9] 最终评估...")
-    print(f"\n{'='*80}")
-    print(f"训练完成！")
-    print(f"{'='*80}")
+    log_and_print("\n[7/9] 最终评估...", LOG_FILE)
+    log_and_print(f"\n{'='*80}", LOG_FILE)
+    log_and_print(f"训练完成！", LOG_FILE)
+    log_and_print(f"{'='*80}", LOG_FILE)
     
     # 找到最大准确率对应的epoch
     best_official_epoch = np.argmax(official_test_acc_history) + 1  # +1 因为epoch从1开始
     best_error_epoch = np.argmax(error_cases_acc_history) + 1
     
-    print(f"最佳官方测试准确率: {best_test_acc:.4f} (Epoch {best_official_epoch})")
-    print(f"对应的错误案例准确率: {best_error_acc:.4f}")
-    print(f"\n错误案例集最佳准确率: {max(error_cases_acc_history):.4f} (Epoch {best_error_epoch})")
+    log_and_print(f"最佳官方测试准确率: {best_test_acc:.4f} (Epoch {best_official_epoch})", LOG_FILE)
+    log_and_print(f"对应的错误案例准确率: {best_error_acc:.4f}", LOG_FILE)
+    log_and_print(f"\n错误案例集最佳准确率: {max(error_cases_acc_history):.4f} (Epoch {best_error_epoch})", LOG_FILE)
     
     # 输出每个epoch的准确率历史
-    print(f"\n{'='*80}")
-    print("📊 每个Epoch的准确率历史")
-    print(f"{'='*80}")
-    print(f"官方测试集准确率 (每个epoch): {official_test_acc_history}")
-    print(f"错误案例集准确率 (每个epoch): {error_cases_acc_history}")
-    print(f"\n官方测试集最大准确率: {max(official_test_acc_history):.4f} 在 Epoch {best_official_epoch}")
-    print(f"错误案例集最大准确率: {max(error_cases_acc_history):.4f} 在 Epoch {best_error_epoch}")
-    print(f"{'='*80}")
+    log_and_print(f"\n{'='*80}", LOG_FILE)
+    log_and_print("📊 每个Epoch的准确率历史", LOG_FILE)
+    log_and_print(f"{'='*80}", LOG_FILE)
+    log_and_print(f"官方测试集准确率 (每个epoch): {official_test_acc_history}", LOG_FILE)
+    log_and_print(f"错误案例集准确率 (每个epoch): {error_cases_acc_history}", LOG_FILE)
+    log_and_print(f"\n官方测试集最大准确率: {max(official_test_acc_history):.4f} 在 Epoch {best_official_epoch}", LOG_FILE)
+    log_and_print(f"错误案例集最大准确率: {max(error_cases_acc_history):.4f} 在 Epoch {best_error_epoch}", LOG_FILE)
+    log_and_print(f"{'='*80}", LOG_FILE)
     
     # 7.1 官方测试集分类报告
     print(f"\n{'='*80}")
