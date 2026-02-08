@@ -26,6 +26,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 from datetime import datetime
 
+# 方案 B：导入 torch（用于加载缓存）
+if args.use_bert_fusion == 1:
+    import torch
+
 
 # Function to set random seed for reproducibility 2675
 # 通过设置一个固定的种子值，我们可以确保每次实验的初始化和随机过程相同，从而使得实验的结果可重复
@@ -454,6 +458,49 @@ class Coach:
         self.model = Model().cuda()
         mode_msg = "模型模式：启用LLM文本嵌入 + 结构特征 (MoE)" if getattr(self.model, 'use_text_features', False) \
             else "模型模式：仅使用结构嵌入"
+        
+        # 方案 B：加载预计算的 BERT 特征缓存
+        if args.use_bert_fusion == 1:
+            mode_msg = "模型模式：方案 B - GCN + BioLinkBERT 融合（使用预计算特征缓存）"
+            print("\n🔥 加载预计算的 BERT 特征缓存...")
+            
+            try:
+                from pathlib import Path
+                # 构建缓存文件路径
+                DATA_ROOT = Path(__file__).resolve().parent.parent / 'Data' / args.data
+                cache_file = DATA_ROOT / 'bert_features_cache' / f'bert_features_{args.data}_cached.pt'
+                
+                if not cache_file.exists():
+                    raise FileNotFoundError(
+                        f"BERT 特征缓存文件不存在: {cache_file}\n"
+                        f"请先运行: python precompute_bert_features_for_training.py --data {args.data}"
+                    )
+                
+                print(f"  ✓ 加载缓存文件: {cache_file}")
+                cache_data = torch.load(cache_file, map_location='cpu', weights_only=False)
+                
+                # 验证缓存数据
+                if 'bert_features' not in cache_data:
+                    raise ValueError("缓存文件格式错误：缺少 'bert_features' 字段")
+                
+                bert_features_cache = cache_data['bert_features']
+                print(f"  ✓ 成功加载 {len(bert_features_cache)} 对 BERT 特征")
+                print(f"  ✓ 特征维度: {cache_data.get('feature_dim', 1024)}")
+                print(f"  ✓ 数据集: {cache_data.get('dataset', 'unknown')}")
+                
+                # 将缓存注入到模型中
+                self.model.bert_features_cache = bert_features_cache
+                
+                print("  ✓ BERT 特征缓存已注入到模型")
+                print(f"  ✓ 训练策略: 微调 GCN + 训练融合层（BERT 特征预计算）")
+                print(f"  ✓ 预期加速: 450x（避免每个 epoch 重复计算 BERT）")
+                
+            except Exception as e:
+                print(f"❌ 加载 BERT 特征缓存失败: {e}")
+                print("  回退到普通 GCN 模式")
+                args.use_bert_fusion = 0
+                mode_msg = "模型模式：仅使用结构嵌入（BERT 缓存加载失败）"
+        
         print(mode_msg)
         log(mode_msg)
         if self.log_file:
@@ -469,7 +516,23 @@ class Coach:
                 self.model = t.nn.DataParallel(self.model, device_ids=available_gpus)
                 self.is_data_parallel = True
 
-        self.opt = t.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=0)
+        # 方案 B：只优化 GCN 和融合层参数
+        if args.use_bert_fusion == 1:
+            # 收集需要训练的参数
+            trainable_params = []
+            trainable_params.extend(self.model.parameters())  # GCN 参数
+            
+            # BERT 参数已经冻结，不会被优化
+            print(f"  ✓ 可训练参数数量: {sum(p.numel() for p in trainable_params if p.requires_grad)}")
+            print(f"  ✓ 冻结参数数量: {sum(p.numel() for p in self.model.parameters() if not p.requires_grad)}")
+            
+            self.opt = t.optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()), 
+                lr=args.lr, 
+                weight_decay=0
+            )
+        else:
+            self.opt = t.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=0)
 
     def get_model(self):
         """获取原始模型，处理DataParallel包装问题"""
@@ -1427,7 +1490,14 @@ class Coach:
                     print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
 
             # 计算交叉熵损失
-            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            if args.use_bert_fusion == 1:
+                # 方案 B 优化版：使用预计算的 BERT 特征缓存
+                ceLoss, sslLoss = self.get_model().calcLosses_with_bert_cached(
+                    drugs, genes, labels, self.handler.torchBiAdj, args.keepRate
+                )
+            else:
+                # 原有方案
+                ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
             regLoss = calcRegLoss(self.model) * args.reg
             # loss = ceLoss + regLoss
             loss = ceLoss + regLoss + sslLoss
@@ -1476,8 +1546,14 @@ class Coach:
             drugs = drugs.long().cuda()
             genes = genes.long().cuda()
             labels = labels.long().cuda()
-            # predict(self, adj, drugs, genes)
-            pre_logits = self.get_model().predict(self.handler.torchBiAdj, drugs, genes)
+            
+            # 根据是否使用 BERT 融合选择预测方法
+            if args.use_bert_fusion == 1:
+                # 方案 B 优化版：使用预计算的 BERT 特征缓存
+                pre_logits = self.get_model().predict_with_bert_cached(self.handler.torchBiAdj, drugs, genes)
+            else:
+                # 原有方案
+                pre_logits = self.get_model().predict(self.handler.torchBiAdj, drugs, genes)
             # dim=1 指定了 softmax 操作沿着第 1 维（即类别维度）进行
             pre = F.log_softmax(pre_logits, dim=1)
             # 选出可能性最大的类别，优化GPU->CPU传输
@@ -1721,12 +1797,28 @@ if __name__ == '__main__':
         if not np.isnan(best_acc) and best_acc > 0.948 and best_acc > global_best_acc:
             global_best_acc = best_acc
             global_best_iteration = i + 1
-            # 保存当前最佳模型的状态字典
+            
+            # 获取完整模型状态
             if coach.is_data_parallel:
-                global_best_model_state = deepcopy(coach.model.module.state_dict())
+                full_state_dict = coach.model.module.state_dict()
             else:
-                global_best_model_state = deepcopy(coach.model.state_dict())
+                full_state_dict = coach.model.state_dict()
+            
+            # 只保存初始嵌入层和GCN层（过滤掉分类器和其他组件）
+            gcn_only_state = {
+                k: deepcopy(v) for k, v in full_state_dict.items()
+                if k.startswith('dEmbeds') or k.startswith('gEmbeds') or k.startswith('gcnLayers')
+            }
+            
+            global_best_model_state = gcn_only_state
+            
+            # 统计保存的参数
+            total_params = len(full_state_dict)
+            saved_params = len(gcn_only_state)
+            filtered_params = total_params - saved_params
+            
             print(f"🏆 New global best model: ACC={best_acc:.4f} at iteration {i + 1}, epoch {best_epoch}")
+            print(f"   保存参数: {saved_params}/{total_params} (过滤了 {filtered_params} 个分类器/其他参数)")
 
     plt.plot(iteration_list, end_acc_list)
     plt.ylabel('accuracy')
@@ -1878,24 +1970,37 @@ if __name__ == '__main__':
 
     save_results_to_log(overall_iteration_best, coach)
     
-    # 新增：保存全局最佳模型
+    # 新增：保存全局最佳模型（只保存GCN相关参数）
     if global_best_model_state is not None and global_best_acc > 0.948:
         gcn_model_dir = "/mnt/data/huangpeng/DGCL/DGCL-main/Code/GCN"
         os.makedirs(gcn_model_dir, exist_ok=True)
         
-        model_filename = f"{args.data}_best_iter{global_best_iteration}_acc{global_best_acc:.4f}.pkl"
+        model_filename = f"{args.data}_GCN_only_iter{global_best_iteration}_acc{global_best_acc:.4f}.pkl"
         model_save_path = os.path.join(gcn_model_dir, model_filename)
         
         try:
+            # 验证保存的参数
+            saved_keys = list(global_best_model_state.keys())
+            print(f"\n📋 保存的参数列表:")
+            for key in saved_keys:
+                print(f"  - {key}: {global_best_model_state[key].shape}")
+            
             t.save(global_best_model_state, model_save_path)
             save_msg = (
                 f"\n{'=' * 60}\n"
-                f"💾 全局最佳GCN模型已保存\n"
+                f"💾 全局最佳GCN模型已保存（仅GCN部分）\n"
                 f"{'=' * 60}\n"
                 f"📁 保存路径: {model_save_path}\n"
                 f"🎯 准确率: {global_best_acc:.4f} ({global_best_acc * 100:.2f}%)\n"
                 f"🔢 Iteration: {global_best_iteration}\n"
                 f"📊 数据集: {args.data}\n"
+                f"📦 保存内容:\n"
+                f"   ✓ dEmbeds (药物初始嵌入)\n"
+                f"   ✓ gEmbeds (基因初始嵌入)\n"
+                f"   ✓ gcnLayers (GCN图卷积层)\n"
+                f"   ✗ classifierLayer (已过滤)\n"
+                f"   ✗ 其他组件 (已过滤)\n"
+                f"📈 参数数量: {len(global_best_model_state)}\n"
                 f"{'=' * 60}\n"
             )
             print(save_msg)
@@ -1905,6 +2010,8 @@ if __name__ == '__main__':
         except Exception as e:
             error_msg = f"❌ 保存模型失败: {e}\n"
             print(error_msg)
+            import traceback
+            traceback.print_exc()
             log_file_handle = open(log_filepath, 'a', encoding='utf-8')
             log_file_handle.write(error_msg)
             log_file_handle.close()
