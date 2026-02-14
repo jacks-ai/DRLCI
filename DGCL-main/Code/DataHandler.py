@@ -11,8 +11,6 @@ from multiprocessing import Pool, cpu_count
 import time
 
 
-
-
 class DataHandler:
     def __init__(self):
         self.data = args.data
@@ -181,7 +179,8 @@ class DataHandler:
             device = 'cuda:{}'.format(args.gpu) if use_cuda else 'cpu'
             args.device = device
 
-        args.class_weights = t.tensor([ value / sum([value for _, value in weighted_data])  for key, value in weighted_data]).to(args.device)
+        args.class_weights = t.tensor(
+            [value / sum([value for _, value in weighted_data]) for key, value in weighted_data]).to(args.device)
 
         if not args.validate:
             d_train_idx = np.hstack([d_train_idx, d_val_idx])
@@ -286,8 +285,8 @@ class DataHandler:
 
         # Apply thresholding to the adjacency matrices
         trnMat, tstMat = relation_mx_train, relation_mx_test
-        trnMat_label   = trnMat.copy()
-        trnMat_label.data   = trnMat_label.data - 1
+        trnMat_label = trnMat.copy()
+        trnMat_label.data = trnMat_label.data - 1
         trnMat_label = trnMat_label.tocoo()
 
         trnMat[trnMat >= 1] = 1
@@ -301,7 +300,7 @@ class DataHandler:
         args.num_classes = len(class_values)
         self.torchBiAdj = self.makeTorchAdj(trnMat)
 
-        trnData = TrnData(train_labels, d_train_idx, g_train_idx ,trnMat ,trnMat_label)
+        trnData = TrnData(train_labels, d_train_idx, g_train_idx, trnMat, trnMat_label)
         self.trnLoader = dataloader.DataLoader(trnData, batch_size=args.batch, shuffle=False,
                                                num_workers=0, )  # already shuffled training set
         if args.validate:
@@ -313,15 +312,20 @@ class DataHandler:
 
 # Data loader for training data
 class TrnData(data.Dataset):
-    def __init__(self, train_labels, d_train_idx, g_train_idx, coomat , coomat_label):
+    def __init__(self, train_labels, d_train_idx, g_train_idx, coomat, coomat_label):
         self.train_labels = train_labels
         self.d_train_idx = d_train_idx
         self.g_train_idx = g_train_idx
-        self.dokmat = coomat.todok()      # 稀疏矩阵(DOK格式)
+        self.dokmat = coomat.todok()  # 稀疏矩阵(DOK格式)
         self.dokmat_label = coomat_label  # 带标签的稀疏矩阵
-        self.negs =  np.zeros((len(d_train_idx), args.num_neg)).astype(np.int32)
+        self.negs = np.zeros((len(d_train_idx), args.num_neg)).astype(np.int32)
 
-    def negSampling(self, positive_genes_dict=None):
+        self.negs_mul_gene_label = []
+        self.negs_mul_gene =  []
+        self.negs_mul_drug_label = []
+        self.negs_mul_drug = []
+
+    def negSampling(self):
         """
         多核并行优化的负采样函数：批量采样 + 向量化过滤 + 多进程并行
         性能提升：利用40个CPU核心并行处理
@@ -332,14 +336,14 @@ class TrnData(data.Dataset):
             raise RuntimeError(
                 "positive_genes_dict 未设置。请先读取缓存并注入"
             )
-        
+
         # 确定使用的进程数（最多使用35个核心，留5个给系统）
         num_processes = min(35, cpu_count())
-        
+
         # 将样本分块，每块分配给一个进程
         total_samples = len(self.d_train_idx)
         chunk_size = max(1, total_samples // num_processes)
-        
+
         # 准备并行处理的参数
         chunks = []
         for i in range(0, total_samples, chunk_size):
@@ -347,21 +351,22 @@ class TrnData(data.Dataset):
             chunk_drugs = self.d_train_idx[i:end_idx]
             chunk_indices = list(range(i, end_idx))
             chunks.append((chunk_drugs, chunk_indices, self.positive_genes_dict))
-        
+
         # 并行处理
         parallel_start = time.time()
         with Pool(processes=num_processes) as pool:
             results = pool.map(self._process_chunk, chunks)
-        
+
         # 合并结果
         for chunk_results, chunk_indices in results:
             for idx, neg_samples in enumerate(chunk_results):
                 self.negs[chunk_indices[idx]] = neg_samples
-        
+
         total_time = time.time() - start_time
         parallel_time = time.time() - parallel_start
-        print(f"使用 {num_processes} 个CPU核心进行并行负采样,总耗时: {total_time:.2f}秒，并行处理: {parallel_time:.2f}秒")
-    
+        print(
+            f"使用 {num_processes} 个CPU核心进行并行负采样,总耗时: {total_time:.2f}秒，并行处理: {parallel_time:.2f}秒")
+
     @staticmethod
     def _process_chunk(chunk_data):
         """
@@ -369,27 +374,27 @@ class TrnData(data.Dataset):
         用于多进程并行处理
         """
         chunk_drugs, chunk_indices, positive_genes_dict = chunk_data
-        
+
         # 批量生成候选负样本的参数
         oversample_factor = 5  # 增加过采样因子以减少补充次数
         total_candidates = args.num_neg * oversample_factor
-        
+
         chunk_results = []
-        
+
         for drug in chunk_drugs:
             pos_genes = positive_genes_dict[drug]
             pos_genes_array = np.array(list(pos_genes))  # 转换为numpy数组提高效率
-            
+
             # 批量生成候选负样本
             candidates = np.random.randint(0, args.gene, size=total_candidates)
-            
+
             # 向量化过滤：移除正样本（优化版本）
             if len(pos_genes) > 0:
                 mask = ~np.isin(candidates, pos_genes_array)
                 valid_negatives = candidates[mask]
             else:
                 valid_negatives = candidates
-            
+
             # 如果有效负样本不够，继续生成（减少循环次数）
             max_attempts = 3  # 最多尝试3次
             attempt = 0
@@ -397,35 +402,90 @@ class TrnData(data.Dataset):
                 needed = args.num_neg - len(valid_negatives)
                 additional_size = max(needed * 3, total_candidates)  # 动态调整生成数量
                 additional_candidates = np.random.randint(0, args.gene, size=additional_size)
-                
+
                 if len(pos_genes) > 0:
                     additional_mask = ~np.isin(additional_candidates, pos_genes_array)
                     additional_valid = additional_candidates[additional_mask]
                 else:
                     additional_valid = additional_candidates
-                    
+
                 valid_negatives = np.concatenate([valid_negatives, additional_valid])
                 attempt += 1
-            
+
             # 取前num_neg个作为最终的负样本
             if len(valid_negatives) >= args.num_neg:
                 result = valid_negatives[:args.num_neg]
             else:
                 # 如果还是不够，用重复采样填充（很少发生）
-                result = np.pad(valid_negatives, (0, args.num_neg - len(valid_negatives)), 
-                              mode='wrap')[:args.num_neg]
-            
+                result = np.pad(valid_negatives, (0, args.num_neg - len(valid_negatives)),
+                                mode='wrap')[:args.num_neg]
+
             chunk_results.append(result)
-        
+
         return chunk_results, chunk_indices
+
+    def negMul_gene(self):
+        for i in range(len(self.d_train_idx)):
+            u = self.d_train_idx[i]
+            mask = self.dokmat_label.row == u
+            filtered_label = self.dokmat_label.data[mask]
+            # filtered_drugs = self.dokmat_label.row[mask]
+            filtered_genes = self.dokmat_label.col[mask]
+            self.negs_mul_gene_label.append(filtered_label)
+            self.negs_mul_gene.append(filtered_genes)
+
+    def negMul_drug(self):
+        for i in range(len(self.g_train_idx)):
+            u = self.g_train_idx[i]
+            mask = self.dokmat_label.col == u
+            filtered_label = self.dokmat_label.data[mask]
+
+            filtered_drugs = self.dokmat_label.row[mask]
+            self.negs_mul_drug_label.append(filtered_label)
+            self.negs_mul_drug.append(filtered_drugs)
+
+    def padded_matrix(self):
+        def pad_matrix(matrix, max_len):
+            # 直接分配填充后的矩阵，并一次性填充
+            padded_matrix = np.full((len(matrix), max_len), -1, dtype=int)
+            for i, row in enumerate(matrix):
+                padded_matrix[i, :len(row)] = row
+            return padded_matrix
+
+        # 计算 gene 的最大长度
+        max_len_gene = max(
+            max(len(row) for row in self.negs_mul_gene_label),
+            max(len(row) for row in self.negs_mul_gene)
+        )
+
+        # 填充 negs_mul_gene_label 和 negs_mul_gene
+        self.negs_mul_gene_label = pad_matrix(self.negs_mul_gene_label, max_len_gene)
+        self.negs_mul_gene = pad_matrix(self.negs_mul_gene, max_len_gene)
+
+        # 计算 drug 的最大长度
+        max_len_drug = max(
+            max(len(row) for row in self.negs_mul_drug_label),
+            max(len(row) for row in self.negs_mul_drug)
+        )
+
+        # 填充 negs_mul_drug_label 和 negs_mul_drug
+        self.negs_mul_drug_label = pad_matrix(self.negs_mul_drug_label, max_len_drug)
+        self.negs_mul_drug = pad_matrix(self.negs_mul_drug, max_len_drug)
 
     def __len__(self):
         return len(self.train_labels)
 
     def __getitem__(self, idx):
-        return self.d_train_idx[idx], self.g_train_idx[idx], self.train_labels[idx] ,self.negs[idx]
-        # return self.d_train_idx[idx], self.g_train_idx[idx], self.train_labels[idx], self.negs[idx], \
-        # self.negs_mul_gene_label[idx], self.negs_mul_gene[idx]
+        # 检查局部负样本列表是否已初始化（在预计算阶段这些列表为空）
+        if len(self.negs_mul_gene_label) == 0:
+            # 预计算阶段：只返回基本信息（4个元素）
+            return self.d_train_idx[idx], self.g_train_idx[idx], self.train_labels[idx], self.negs[idx]
+        else:
+            # 训练阶段：返回完整信息（8个元素）
+            return self.d_train_idx[idx], self.g_train_idx[idx], self.train_labels[idx], self.negs[idx], \
+                self.negs_mul_gene_label[idx], self.negs_mul_gene[idx], self.negs_mul_drug_label[idx], \
+            self.negs_mul_drug[idx]
+
 
 # Data loader for testing data
 class TstData(data.Dataset):
