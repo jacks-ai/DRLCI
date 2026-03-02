@@ -92,7 +92,7 @@ LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
 TRAIN_CONFIG = {
     'batch_size': 16,              # FP16开启后可增大到 24-32
     'learning_rate': CUSTOM_LEARNING_RATE,  # 从命令行参数读取 (已在文件开头解析)
-    'num_epochs': 10,              # BERT微调推荐: 3-10 epochs
+    'num_epochs': 12,              # BERT微调推荐: 3-10 epochs
     'warmup_ratio': 0.1,           # 预热10%的训练步数
     'max_grad_norm': 1.0,          # 梯度裁剪 (BERT标准: 1.0)
     'weight_decay': 0.01,          # AdamW权重衰减 (BERT标准: 0.01)
@@ -569,19 +569,18 @@ def main():
         if error_acc > best_error_acc:
             best_error_acc = error_acc
             best_test_acc = test_acc  # 记录此时官方测试集的准确率
-            save_path = CODE_DIR / f'bert/best_biolinkbert_classifier_{timestamp}.pt'
+            save_path = CODE_DIR / f'bert/best_biolinkbert_only_{timestamp}.pt'
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'bert_state_dict': model.bert.state_dict(),  # 只保存BioLinkBERT模型
                 'test_acc': test_acc,
                 'test_top5_acc': test_top5_acc,
                 'error_acc': error_acc,
                 'error_top5_acc': error_top5_acc,
                 'config': TRAIN_CONFIG,
             }, save_path)
-            print(f"  ✓ 保存最佳模型 (基于错误案例集): {save_path}")
-            log_and_print(f"Epoch {epoch}: 保存最佳模型 (error_acc={error_acc:.4f}, test_acc={test_acc:.4f})", LOG_FILE)
+            print(f"  ✓ 保存最佳BioLinkBERT模型 (不含MLP): {save_path}")
+            log_and_print(f"Epoch {epoch}: 保存最佳BioLinkBERT模型 (error_acc={error_acc:.4f}, test_acc={test_acc:.4f})", LOG_FILE)
     
     total_training_time = time.time() - training_start_time
     log_and_print(f"\n总训练时间: {total_training_time/60:.1f} 分钟", LOG_FILE)
