@@ -45,51 +45,56 @@ class Model(nn.Module):
         self.dEmbeds = nn.Parameter(init(t.empty(args.drug, args.latdim)))  # 药物结构嵌入
         self.gEmbeds = nn.Parameter(init(t.empty(args.gene, args.latdim)))  # 基因结构嵌入
 
-        # 检查是否使用额外的文本特征
-        self.use_text_features = (
-                args.use_llm_embeddings
-                and args.pretrained_drug_embed_path is not None
-                and args.pretrained_gene_embed_path is not None
-        )
-
-        if self.use_text_features:
-            # 步骤 2: 加载预训练 LLM 嵌入
-            print("加载预训练的LLM文本嵌入作为辅助特征...")
-            drug_embeds_text = t.from_numpy(np.load(args.pretrained_drug_embed_path)).float()
-            gene_embeds_text = t.from_numpy(np.load(args.pretrained_gene_embed_path)).float()
-
-            print(drug_embeds_text.shape[0])
-            print(args.drug)
-            assert drug_embeds_text.shape[0] == args.drug, "Drug count mismatch"
-            assert gene_embeds_text.shape[0] == args.gene, "Gene count mismatch"
-
-            drug_text_dim = drug_embeds_text.shape[1]
-            gene_text_dim = gene_embeds_text.shape[1]
-
-            # 投影层：将文本维度对齐到 args.latdim
-            self.drug_text_proj = nn.Linear(drug_text_dim, args.latdim)
-            self.gene_text_proj = nn.Linear(gene_text_dim, args.latdim)
-
-            # 初始化权重
-            nn.init.xavier_uniform_(self.drug_text_proj.weight)
-            nn.init.xavier_uniform_(self.gene_text_proj.weight)
-
-            self.register_buffer('drug_embeds_text', drug_embeds_text)
-            self.register_buffer('gene_embeds_text', gene_embeds_text)
-
-            # 初始化门控拼接融合模块
-            self.fusion_layer = GatedConcatFusion(args.latdim)
-            print("Gated Concat 融合模块已初始化.")
-        else:
+        # 联合编码 或 实体级文本：二选一
+        self.use_joint_encoding = getattr(args, 'use_joint_encoding', False)
+        self.use_text_features = False
+        if args.use_llm_embeddings:
+            if self.use_joint_encoding and getattr(args, 'joint_embed_train_path', None) and getattr(args, 'joint_embed_test_path', None):
+                self.use_text_features = True
+                self._init_joint_embeddings(args)
+            elif not self.use_joint_encoding and args.pretrained_drug_embed_path and args.pretrained_gene_embed_path:
+                self.use_text_features = True
+                self._init_entity_embeddings(args)
+        if not self.use_text_features:
             print("随机初始化，Initializing drug and gene embeddings randomly.")
 
-        # Initialize GCN
+        # (d_idx, g_idx) -> train/test 行号，由 Main 从 DataHandler 注入
+        self.train_pair_to_row = None
+        self.test_pair_to_row = None
+
+        # GCN / 分类器 / DropEdge（所有分支共用）
         self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
-
-        # Initialize classifier
         self.classifierLayer = ClassifierLayer()
-
         self.edgeDropper = SpAdjDropEdge()
+
+    def _init_joint_embeddings(self, args):
+        """联合编码：加载 joint_embeddings_train/test.npy，投影 1024 -> latdim"""
+        print("加载联合编码文本嵌入 (joint_embeddings_*.npy)...")
+        joint_train = t.from_numpy(np.load(args.joint_embed_train_path)).float()
+        joint_test = t.from_numpy(np.load(args.joint_embed_test_path)).float()
+        joint_dim = joint_train.shape[1]  # 1024
+        self.joint_text_proj = nn.Linear(joint_dim, args.latdim)
+        nn.init.xavier_uniform_(self.joint_text_proj.weight)
+        self.register_buffer('joint_embeds_train', joint_train)
+        self.register_buffer('joint_embeds_test', joint_test)
+        print(f"  训练联合嵌入路径: {args.joint_embed_train_path}, 测试: {args.joint_embed_test_path}，，，，，，，，，，，，，，")
+        print(f"  训练联合嵌入: {joint_train.shape}, 测试: {joint_test.shape}, 投影 -> {args.latdim}")
+
+    def _init_entity_embeddings(self, args):
+        """实体级：药物/基因分别嵌入 + 门控融合"""
+        print("加载预训练的LLM文本嵌入作为辅助特征（实体级）...")
+        drug_embeds_text = t.from_numpy(np.load(args.pretrained_drug_embed_path)).float()
+        gene_embeds_text = t.from_numpy(np.load(args.pretrained_gene_embed_path)).float()
+        assert drug_embeds_text.shape[0] == args.drug, "Drug count mismatch"
+        assert gene_embeds_text.shape[0] == args.gene, "Gene count mismatch"
+        self.drug_text_proj = nn.Linear(drug_embeds_text.shape[1], args.latdim)
+        self.gene_text_proj = nn.Linear(gene_embeds_text.shape[1], args.latdim)
+        nn.init.xavier_uniform_(self.drug_text_proj.weight)
+        nn.init.xavier_uniform_(self.gene_text_proj.weight)
+        self.register_buffer('drug_embeds_text', drug_embeds_text)
+        self.register_buffer('gene_embeds_text', gene_embeds_text)
+        self.fusion_layer = GatedConcatFusion(args.latdim)
+        print("Gated Concat 融合模块已初始化.")
 
     def forward(self, adj, keepRate):
         # 步骤 3: GCN 传播 (结构视图)
@@ -103,29 +108,20 @@ class Model(nn.Module):
         final_struct_embeds = sum(embedsLst)
 
         all_text_feat = None
-
-        # 步骤 4: 融合文本特征
-        if self.use_text_features:
-            # 投影文本特征
+        # 步骤 4: 文本特征（联合编码在样本级做，不在此做节点融合）
+        if self.use_text_features and not self.use_joint_encoding:
             drug_text_feat = self.drug_text_proj(self.drug_embeds_text.to(final_struct_embeds.device))
             gene_text_feat = self.gene_text_proj(self.gene_embeds_text.to(final_struct_embeds.device))
-
-            # 归一化 (防止数值范围差异过大)
             drug_text_feat = F.normalize(drug_text_feat, p=2, dim=1)
             gene_text_feat = F.normalize(gene_text_feat, p=2, dim=1)
-
             all_text_feat = t.concat([drug_text_feat, gene_text_feat], axis=0)
-
-            # 使用 Gated Concat 进行融合
-            # 输出维度: [nodes, latdim * 2]
             final_embeds = self.fusion_layer(final_struct_embeds, all_text_feat)
         else:
             final_embeds = final_struct_embeds
 
-        return final_embeds,final_struct_embeds,all_text_feat
+        return final_embeds, final_struct_embeds, all_text_feat
 
     def forward_gcn(self, adj):
-        # 用于推理或无 Dropout 的前向传播
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
         for gcn in self.gcnLayers:
@@ -133,14 +129,12 @@ class Model(nn.Module):
             embedsLst.append(embeds)
         final_struct_embeds = sum(embedsLst)
 
-        if self.use_text_features:
+        if self.use_text_features and not self.use_joint_encoding:
             drug_text_feat = self.drug_text_proj(self.drug_embeds_text.to(final_struct_embeds.device))
             gene_text_feat = self.gene_text_proj(self.gene_embeds_text.to(final_struct_embeds.device))
-
             drug_text_feat = F.normalize(drug_text_feat, p=2, dim=1)
             gene_text_feat = F.normalize(gene_text_feat, p=2, dim=1)
             all_text_feat = t.concat([drug_text_feat, gene_text_feat], axis=0)
-
             final_embeds = self.fusion_layer(final_struct_embeds, all_text_feat)
         else:
             final_embeds = final_struct_embeds
@@ -148,13 +142,19 @@ class Model(nn.Module):
         return final_embeds[:args.drug], final_embeds[args.drug:]
 
     def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds,struct_view,text_view = self.forward(adj, keepRate)
-        dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
-
-        dEmbeds = dEmbeds[drugs]
-        gEmbeds = gEmbeds[genes]
-
-        pre = self.classifierLayer(dEmbeds, gEmbeds)
+        embeds, struct_view, text_view = self.forward(adj, keepRate)
+        if self.use_joint_encoding:
+            struct_d = struct_view[:args.drug][drugs]
+            struct_g = struct_view[args.drug:][genes]
+            row_indices = [self.train_pair_to_row[(d.item(), g.item())] for d, g in zip(drugs.cpu(), genes.cpu())]
+            row_indices = t.tensor(row_indices, dtype=t.long, device=embeds.device)
+            batch_joint = self.joint_embeds_train.to(embeds.device)[row_indices]
+            batch_joint = F.normalize(self.joint_text_proj(batch_joint), p=2, dim=1)
+            pre = self.classifierLayer(struct_d, struct_g, batch_joint)
+        else:
+            dEmbeds = embeds[:args.drug][drugs]
+            gEmbeds = embeds[args.drug:][genes]
+            pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
         sslLoss=0
         # 没有用
@@ -166,13 +166,19 @@ class Model(nn.Module):
         return ceLoss, sslLoss
 
     def predict(self, adj, drugs, genes):
-        embeds,_,_ = self.forward(adj, 1.0)
-        dEmbeds, gEmbeds = embeds[:args.drug], embeds[args.drug:]
-
-        dEmbeds = dEmbeds[drugs]
-        gEmbeds = gEmbeds[genes]
-
-        pre = self.classifierLayer(dEmbeds, gEmbeds)
+        embeds, struct_view, _ = self.forward(adj, 1.0)
+        if self.use_joint_encoding:
+            struct_d = struct_view[:args.drug][drugs]
+            struct_g = struct_view[args.drug:][genes]
+            row_indices = [self.test_pair_to_row[(d.item(), g.item())] for d, g in zip(drugs.cpu(), genes.cpu())]
+            row_indices = t.tensor(row_indices, dtype=t.long, device=embeds.device)
+            batch_joint = self.joint_embeds_test.to(embeds.device)[row_indices]
+            batch_joint = F.normalize(self.joint_text_proj(batch_joint), p=2, dim=1)
+            pre = self.classifierLayer(struct_d, struct_g, batch_joint)
+        else:
+            dEmbeds = embeds[:args.drug][drugs]
+            gEmbeds = embeds[args.drug:][genes]
+            pre = self.classifierLayer(dEmbeds, gEmbeds)
         return pre
 
     def getEmbeds(self):
@@ -218,26 +224,23 @@ class SpAdjDropEdge(nn.Module):
 class ClassifierLayer(nn.Module):
     def __init__(self):
         super(ClassifierLayer, self).__init__()
-
-        # 步骤 5: 动态调整分类器输入维度
-        # 基础维度
         input_dim = args.latdim
-
-        # [关键修改]
-        # 如果使用文本特征，经过 GatedConcatFusion 后，节点嵌入维度是 latdim * 2
-        # 分类器输入是 (Drug || Gene)，所以总维度是 (latdim * 2) * 2 = latdim * 4
-        if args.use_llm_embeddings:
+        # 联合编码: (struct_d, struct_g, joint_proj) -> latdim*3；实体级: (d, g) 各 latdim*2 -> latdim*4；仅结构: latdim*2
+        if getattr(args, 'use_joint_encoding', False):
+            classifier_input_dim = input_dim * 3
+        elif args.use_llm_embeddings:
             classifier_input_dim = input_dim * 4
         else:
-            # 仅结构: latdim + latdim = latdim * 2
             classifier_input_dim = input_dim * 2
 
         self.lin1 = nn.Linear(classifier_input_dim, 128)
         self.lin2 = nn.Linear(128, args.num_classes)
 
-    def forward(self, dEmbeds, gEmbeds):
-        embeds = t.concat((dEmbeds, gEmbeds), 1)
+    def forward(self, dEmbeds, gEmbeds, joint_embed=None):
+        if joint_embed is not None:
+            embeds = t.cat((dEmbeds, gEmbeds, joint_embed), dim=1)
+        else:
+            embeds = t.cat((dEmbeds, gEmbeds), dim=1)
         embeds = F.relu(self.lin1(embeds))
         embeds = F.dropout(embeds, p=0.4, training=self.training)
-        ret = self.lin2(embeds)
-        return ret
+        return self.lin2(embeds)

@@ -495,8 +495,9 @@ class Coach:
     # Function to prepare the model and optimizer
     def prepareModel(self):
         self.model = Model().cuda()
-        mode_msg = "模型模式：启用LLM文本嵌入 + 结构特征 (MoE)" if getattr(self.model, 'use_text_features', False) \
-            else "模型模式：仅使用结构嵌入"
+        mode_msg = "模型模式：联合编码文本 + 结构特征" if getattr(self.model, 'use_joint_encoding', False) \
+            else ("模型模式：实体级LLM文本嵌入 + 结构特征" if getattr(self.model, 'use_text_features', False) \
+                 else "模型模式：仅使用结构嵌入")
         print(mode_msg)
         log(mode_msg)
         if self.log_file:
@@ -511,6 +512,10 @@ class Coach:
                 print(f"Wrapping model with DataParallel on GPUs: {available_gpus}")
                 self.model = t.nn.DataParallel(self.model, device_ids=available_gpus)
                 self.is_data_parallel = True
+
+        if getattr(self.get_model(), 'use_joint_encoding', False):
+            self.get_model().train_pair_to_row = getattr(self.handler, 'train_pair_to_row', None)
+            self.get_model().test_pair_to_row = getattr(self.handler, 'test_pair_to_row', None)
 
         self.opt = t.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=0)
 
