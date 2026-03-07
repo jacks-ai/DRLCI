@@ -67,13 +67,24 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
     total_errors = sum(len(iter_info['error_cases']) for iter_info in all_iteration_errors)
     avg_errors = total_errors / len(all_iteration_errors) if all_iteration_errors else 0
 
+    # 确定类别数量（从第一个有错误案例的iteration中获取）
+    num_classes = 0
+    for iter_info in all_iteration_errors:
+        if len(iter_info['error_cases']) > 0:
+            num_classes = len(iter_info['error_cases'][0].get('prob_distribution', []))
+            break
+
     # 写入CSV文件
     try:
         with open(csv_filepath, 'w', newline='', encoding='utf-8') as csvfile:
             csv_writer = csv.writer(csvfile)
 
-            # 写入CSV表头
-            csv_writer.writerow(['Iteration', 'Best_Epoch', 'Best_ACC', '药物ID', '基因ID', '预测标签', '真实标签'])
+            # 动态生成CSV表头（包含概率分布列）
+            header = ['Iteration', 'Best_Epoch', 'Best_ACC', '药物ID', '基因ID', 
+                     '预测标签', '真实标签', '最大概率', '预测类概率', '真实类概率']
+            if num_classes > 0:
+                header.extend([f'类别{i}概率' for i in range(num_classes)])
+            csv_writer.writerow(header)
 
             # 遍历每个iteration
             for iter_info in all_iteration_errors:
@@ -85,26 +96,26 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
                 if len(error_cases) > 0:
                     # 写入该iteration的所有错误案例
                     for case in error_cases:
-                        csv_writer.writerow([
+                        row = [
                             iteration,
                             best_epoch,
                             f"{best_acc:.4f}",
                             case['drug'],
                             case['gene'],
                             case['predicted'],
-                            case['actual']
-                        ])
+                            case['actual'],
+                            f"{case.get('max_prob', 0):.4f}",
+                            f"{case.get('predicted_prob', 0):.4f}",
+                            f"{case.get('actual_prob', 0):.4f}"
+                        ]
+                        # 添加完整概率分布
+                        prob_dist = case.get('prob_distribution', [])
+                        row.extend([f"{p:.4f}" for p in prob_dist])
+                        csv_writer.writerow(row)
                 else:
                     # 如果没有错误案例，写入一行说明
-                    csv_writer.writerow([
-                        iteration,
-                        best_epoch,
-                        f"{best_acc:.4f}",
-                        'N/A',
-                        'N/A',
-                        'N/A',
-                        'N/A'
-                    ])
+                    row = [iteration, best_epoch, f"{best_acc:.4f}"] + ['N/A'] * (len(header) - 3)
+                    csv_writer.writerow(row)
 
                 # 在每个iteration后添加空行（用于分隔）
                 csv_writer.writerow([])
@@ -113,6 +124,8 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
 
     except Exception as e:
         print(f"❌ 导出CSV文件失败: {e}")
+        import traceback
+        traceback.print_exc()
         csv_filepath = None
 
     # 在日志文件中记录统计信息
@@ -127,6 +140,11 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
         error_log.append(f"📄 详细错误案例已导出到CSV文件:")
         error_log.append(f"   {csv_filepath}\n")
 
+    # 收集所有错误案例的概率统计
+    all_max_probs = []
+    all_predicted_probs = []
+    all_actual_probs = []
+    
     # 为每个iteration添加简要统计
     for iter_info in all_iteration_errors:
         iteration = iter_info['iteration']
@@ -136,6 +154,20 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
 
         error_log.append(f"\nIteration {iteration} - Best Epoch: {best_epoch} - ACC: {best_acc:.4f}")
         error_log.append(f"  错误案例数: {len(error_cases)}")
+        
+        # 统计该iteration的概率信息
+        if len(error_cases) > 0:
+            iter_max_probs = [case.get('max_prob', 0) for case in error_cases]
+            iter_pred_probs = [case.get('predicted_prob', 0) for case in error_cases]
+            iter_actual_probs = [case.get('actual_prob', 0) for case in error_cases]
+            
+            all_max_probs.extend(iter_max_probs)
+            all_predicted_probs.extend(iter_pred_probs)
+            all_actual_probs.extend(iter_actual_probs)
+            
+            error_log.append(f"  平均最大概率: {np.mean(iter_max_probs):.4f}")
+            error_log.append(f"  平均预测类概率: {np.mean(iter_pred_probs):.4f}")
+            error_log.append(f"  平均真实类概率: {np.mean(iter_actual_probs):.4f}")
 
     # 总体统计信息
     error_log.append(f"\n{'=' * 60}")
@@ -144,6 +176,17 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
     error_log.append(f"总Iteration数: {len(all_iteration_errors)}")
     error_log.append(f"总错误案例数: {total_errors}")
     error_log.append(f"平均每个Iteration错误数: {avg_errors:.2f}")
+    
+    # 添加概率分布统计
+    if len(all_max_probs) > 0:
+        error_log.append(f"\n📈 概率分布统计（所有错误案例）:")
+        error_log.append(f"  平均最大概率: {np.mean(all_max_probs):.4f} ± {np.std(all_max_probs):.4f}")
+        error_log.append(f"  平均预测类概率: {np.mean(all_predicted_probs):.4f} ± {np.std(all_predicted_probs):.4f}")
+        error_log.append(f"  平均真实类概率: {np.mean(all_actual_probs):.4f} ± {np.std(all_actual_probs):.4f}")
+        error_log.append(f"  最大概率范围: [{np.min(all_max_probs):.4f}, {np.max(all_max_probs):.4f}]")
+        error_log.append(f"  预测类概率范围: [{np.min(all_predicted_probs):.4f}, {np.max(all_predicted_probs):.4f}]")
+        error_log.append(f"  真实类概率范围: [{np.min(all_actual_probs):.4f}, {np.max(all_actual_probs):.4f}]")
+    
     error_log.append("=" * 60 + "\n")
 
     error_text = '\n'.join(error_log)
@@ -1403,8 +1446,11 @@ class Coach:
                 # 清零梯度，准备累积
                 self.opt.zero_grad()
                 # 计算总损失用于记录
-                total_loss = hard_loss_value + neg_loss_value + regLoss
-                # total_loss = hard_loss_value + neg_loss_value  + regLoss+ local_bpr_loss
+                if args.data == 'DGIdb':
+                    total_loss = hard_loss_value + neg_loss_value + regLoss + local_bpr_loss
+                else:
+                    total_loss = hard_loss_value + neg_loss_value + regLoss
+
                 # total_loss = neg_loss_value * args.common_neg_weight + regLoss
 
                 # 统一参数更新（基于累积的梯度）
@@ -1488,26 +1534,38 @@ class Coach:
             drugs_cpu = drugs.detach().cpu()
             genes_cpu = genes.detach().cpu()
 
-            # 收集错误案例
+            # 计算概率分布（用于错误案例分析）
+            probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
+            probs_cpu = probs.cpu().detach().numpy()
+
+            # 收集错误案例（包含概率分布信息）
             incorrect_mask = (pre_cpu != labels_cpu)
             for idx in range(len(labels_cpu)):
                 if incorrect_mask[idx]:
+                    prob_dist = probs_cpu[idx]
+                    max_prob = np.max(prob_dist)
+                    predicted_class = pre_cpu[idx].item()
+                    actual_class = labels_cpu[idx].item()
+                    
                     error_cases.append({
                         'drug': drugs_cpu[idx].item(),
                         'gene': genes_cpu[idx].item(),
-                        'predicted': pre_cpu[idx].item(),
-                        'actual': labels_cpu[idx].item()
+                        'predicted': predicted_class,
+                        'actual': actual_class,
+                        'max_prob': max_prob,
+                        'predicted_prob': prob_dist[predicted_class],
+                        'actual_prob': prob_dist[actual_class],
+                        'prob_distribution': prob_dist.tolist()
                     })
 
             epAcc = accuracy_score(labels_cpu, pre_cpu)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
             if args.data == 'DGIdb':
-                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='macro', zero_division=0)
+                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='weighted', zero_division=0)
             else:
                 precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='binary', zero_division=0)
             labels_list.append(labels_cpu.numpy())
-            probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
-            probs_list.append(probs.cpu().detach().numpy())
+            probs_list.append(probs_cpu)
 
         all_labels = np.concatenate(labels_list)
         all_probs = np.vstack(probs_list)  # 所有预测概率
@@ -1618,11 +1676,13 @@ if __name__ == '__main__':
 
     logger.saveDefault = True
 
-    log_dir = os.path.normpath(args.log_dir)
-    os.makedirs(log_dir, exist_ok=True)
+    # 日志根目录固定为指定路径，并在其下按数据集名称创建子目录
+    base_log_dir = "/mnt/data/huangpeng/DGCL/DGCL-main/log"
+    dataset_log_dir = os.path.join(base_log_dir, str(args.data))
+    os.makedirs(dataset_log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     log_filename = f"{timestamp}_{args.data}.txt"
-    log_filepath = os.path.join(log_dir, log_filename)
+    log_filepath = os.path.join(dataset_log_dir, log_filename)
 
     log_file = open(log_filepath, 'w')
     log('Start')
@@ -1640,6 +1700,8 @@ if __name__ == '__main__':
             "=" * 60 + "\n" +
             f"📊 数据集 (data): {args.data}\n" +
             f"📈 学习率 (lr): {args.lr}\n" +
+            f"📐 嵌入维度 (latdim): {args.latdim}\n" +
+            f"🧩 GNN 层数 (gnn_layer): {args.gnn_layer}\n" +
             f"🎲 全局负样本数量 (num_neg): {args.num_neg}\n" +
             f"🔗 二跳邻居数量 (num_two_hop): {args.num_two_hop}\n" +
             f"📏 一跳最大比例 (one_hop_max_ratio): {args.one_hop_max_ratio:.1%} ({int(args.num_two_hop * args.one_hop_max_ratio)} max samples)\n" +
@@ -1820,6 +1882,8 @@ if __name__ == '__main__':
             f.write("超参数配置\n")
             f.write("=" * 60 + "\n")
             f.write(f"学习率 (lr): {args.lr}\n")
+            f.write(f"嵌入维度 (latdim): {args.latdim}\n")
+            f.write(f"GNN 层数 (gnn_layer): {args.gnn_layer}\n")
             f.write(f"全局负样本数量 (num_neg): {args.num_neg}\n")
             f.write(f"二跳邻居数量 (num_two_hop): {args.num_two_hop}\n")
             f.write(

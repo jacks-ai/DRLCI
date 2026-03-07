@@ -17,6 +17,19 @@ PROJECT_ROOT = CODE_DIR.parent
 DATA_ROOT = PROJECT_ROOT / 'Data'
 DEFAULT_MODEL_CACHE = Path(r"/mnt/data/huangpeng/DGCL/mymodel/BioLinkBERT")
 
+# 根据数据集动态选择微调后最佳 BioLinkBERT 权重（只包含 bert_state_dict）
+DATASET_NAME = getattr(train_args, 'data', 'DrugBank')
+if DATASET_NAME == 'DrugBank':
+    # DrugBank 数据集使用你指定的最新微调权重
+    FINE_TUNED_CKPT = Path(
+        "/mnt/data/huangpeng/DGCL/DGCL-main/Code/bert/best_biolinkbert_only_DrugBank_0303_020934.pt"
+    )
+else:
+    # 其他数据集仍然回退到原来的默认权重路径
+    FINE_TUNED_CKPT = Path(
+        "/mnt/data/huangpeng/DGCL/DGCL-main/Code/bert/best_biolinkbert_only_0302_123530.pt"
+    )
+
 
 def main(args):
     print("=" * 80)
@@ -79,9 +92,22 @@ def main(args):
             local_files_only=True,
             trust_remote_code=True
         )
+
+        # 如果存在微调后的BioLinkBERT权重，则加载
+        if FINE_TUNED_CKPT.is_file():
+            print(f"  检测到微调权重: {FINE_TUNED_CKPT}")
+            try:
+                ckpt = torch.load(FINE_TUNED_CKPT, map_location="cpu",weights_only=False)
+                state_dict = ckpt.get("bert_state_dict", ckpt)
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                print(f"  ✓ 已加载微调权重 (missing={len(missing)}, unexpected={len(unexpected)})")
+            except Exception as e:
+                print(f"  ⚠ 加载微调权重失败，将继续使用原始预训练模型: {e}")
+        else:
+            print(f"  未找到微调权重文件，将使用原始预训练BioLinkBERT")
         
         # 将模型移到GPU
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
         print(f"✓ 模型加载完成，设备: {device}")
         print(f"  隐藏层维度: {model.config.hidden_size}")
@@ -120,19 +146,20 @@ def main(args):
 
             outputs = model(**inputs)
             
-            # 使用Mean Pooling（考虑attention mask，更好地利用所有token信息）
-            attention_mask = inputs['attention_mask'].unsqueeze(-1)  # [batch, seq_len, 1]
-            masked_embeddings = outputs.last_hidden_state * attention_mask  # 屏蔽padding
-            sum_embeddings = masked_embeddings.sum(dim=1)  # [batch, hidden_dim]
-            sum_mask = attention_mask.sum(dim=1).clamp(min=1e-9)  # 防止除零
-            mean_embeddings = (sum_embeddings / sum_mask).cpu().float().numpy()
+            # 使用[CLS] token
+            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().float().numpy()
             
-            # 如果想用[CLS] token，可以改为：
-            # cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().float().numpy()
+            # Mean Pooling（考虑attention mask，更好地利用所有token信息）
+            # attention_mask = inputs['attention_mask'].unsqueeze(-1)  # [batch, seq_len, 1]
+            # masked_embeddings = outputs.last_hidden_state * attention_mask  # 屏蔽padding
+            # sum_embeddings = masked_embeddings.sum(dim=1)  # [batch, hidden_dim]
+            # sum_mask = attention_mask.sum(dim=1).clamp(min=1e-9)  # 防止除零
+            # mean_embeddings = (sum_embeddings / sum_mask).cpu().float().numpy()
 
-            for gene_id, embedding in zip(batch_gene_ids, mean_embeddings):
+            for gene_id, embedding in zip(batch_gene_ids, cls_embeddings):
                 embeddings[gene_id] = embedding
 
+# 最后基因文本嵌入顺序与.global_ids_path中的索引顺序完全一致（按照字符串的值排序），与datahandler无关
     ordered_embeddings = np.array([embeddings[gid] for gid in gene_ids], dtype=np.float32)
 
     print(f"\n✓ 生成完成")
@@ -191,24 +218,26 @@ def load_gene_descriptions(mapping_path):
 
 
 def build_default_args():
-    dataset = getattr(train_args, 'data', 'DGIdb')
+    dataset = getattr(train_args, 'data', 'DrugBank')
     dataset_dir = DATA_ROOT / dataset
     gene_text_dir = dataset_dir / 'gene_text'
 
-    global_ids_path = dataset_dir / 'global_ids.json'
+    # global_ids_2.json 位于对应数据集目录下，例如
+    # Data/DGIdb/global_ids_2.json 或 Data/DrugBank/global_ids_2.json
+    global_ids_path = dataset_dir / 'global_ids_2.json'
     mapping_candidates = [
         gene_text_dir / 'gene_embeddings_txt.json',
         gene_text_dir / 'gene_text.json',
     ]
-    for candidate in mapping_candidates:
+    for candidate in mapping_candidates:  #  定义候选文件列表
         if candidate.exists():
             gene_mapping_path = candidate
             break
     else:
         gene_mapping_path = mapping_candidates[0]
 
-    # 添加bert前缀和mean后缀
-    output_path = gene_text_dir / f"bert_{dataset.lower()}_gene_emd_mean.npy"
+    # 添加bert前缀和cls后缀
+    output_path = gene_text_dir / f"ft_bert_{dataset.lower()}_gene_emd_cls.npy"
 
     return SimpleNamespace(
         model_cache_dir=str(DEFAULT_MODEL_CACHE),
