@@ -271,10 +271,15 @@ class Coach:
         ret = 'Epoch %d/%d, %s: ' % (ep, args.epoch, name)
         for metric in reses:
             val = reses[metric]
-            ret += '%s = %.4f, ' % (metric, val)
-            tem = name + metric
-            if save and tem in self.metrics:
-                self.metrics[tem].append(val)
+            # 标量指标按浮点数输出，列表/数组等复杂类型直接转为字符串
+            if np.isscalar(val):
+                ret += '%s = %.4f, ' % (metric, val)
+                tem = name + metric
+                if save and tem in self.metrics:
+                    self.metrics[tem].append(val)
+            else:
+                # 对于如 PerClassAcc 这样的列表型结果，只做打印展示，不参与历史曲线统计
+                ret += '%s = %s, ' % (metric, str(val))
         ret = ret[:-2] + '  '
         return ret
 
@@ -333,6 +338,7 @@ class Coach:
         bestEpoch = 0
         best_errors_in_iteration = []  # 新增：跟踪iteration内最佳epoch的错误案例
         best_acc_in_iteration = 0  # 新增：跟踪iteration内最佳ACC
+        best_per_class_acc_in_iteration = None  # 新增：跟踪iteration内最佳epoch的按类别ACC
 
         test_r = {met: float('nan') for met in self.metrics_to_track}
 
@@ -401,6 +407,7 @@ class Coach:
                 if reses['Acc'] > best_acc_in_iteration:
                     best_acc_in_iteration = reses['Acc']
                     best_errors_in_iteration = error_cases
+                    best_per_class_acc_in_iteration = reses.get('PerClassAcc', None)
 
                 # 记录测试结果
                 log(self.makePrint('Test', ep, reses, tstFlag))
@@ -424,6 +431,7 @@ class Coach:
         if reses['Acc'] > best_acc_in_iteration:
             best_acc_in_iteration = reses['Acc']
             best_errors_in_iteration = final_error_cases
+            best_per_class_acc_in_iteration = reses.get('PerClassAcc', None)
 
         self.save_model('{}'.format(config['iteration']))
 
@@ -489,8 +497,16 @@ class Coach:
             for metric in self.metrics_to_track
         }
 
-        return reses[
-            'Acc'], output_str, aucMax, iteration_best_metrics, best_errors_in_iteration, bestEpoch, best_acc_in_iteration
+        return (
+            reses['Acc'],
+            output_str,
+            aucMax,
+            iteration_best_metrics,
+            best_errors_in_iteration,
+            bestEpoch,
+            best_acc_in_iteration,
+            best_per_class_acc_in_iteration
+        )
 
     # Function to prepare the model and optimizer
     def prepareModel(self):
@@ -1520,6 +1536,9 @@ class Coach:
         probs_list = []  # 新增：用于存储预测概率
         error_cases = []  # 新增：存储错误案例
         i = 0
+        num_classes = None
+        correct_per_class = None
+        total_per_class = None
         for tem in tstLoader:  # for i, tem in enumerate(trnLoader)
             i += 1
             drugs, genes, labels = tem
@@ -1538,6 +1557,12 @@ class Coach:
             labels_cpu = labels.detach().cpu()
             drugs_cpu = drugs.detach().cpu()
             genes_cpu = genes.detach().cpu()
+
+            # 初始化按类别统计的数组
+            if num_classes is None:
+                num_classes = pre_logits.size(1)
+                correct_per_class = np.zeros(num_classes, dtype=np.int64)
+                total_per_class = np.zeros(num_classes, dtype=np.int64)
 
             # 计算概率分布（用于错误案例分析）
             probs = F.softmax(pre_logits, dim=1)  # 使用softmax获取概率
@@ -1562,6 +1587,14 @@ class Coach:
                         'actual_prob': prob_dist[actual_class],
                         'prob_distribution': prob_dist.tolist()
                     })
+
+            # 统计每个类别的正确数和总数
+            for cls in range(num_classes):
+                cls_mask = (labels_cpu == cls)
+                cls_count = cls_mask.sum().item()
+                if cls_count > 0:
+                    total_per_class[cls] += cls_count
+                    correct_per_class[cls] += (pre_cpu[cls_mask] == cls).sum().item()
 
             epAcc = accuracy_score(labels_cpu, pre_cpu)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
@@ -1611,8 +1644,24 @@ class Coach:
         # 调用 plot_tSNE，并传递保存路径
         # self.plot_tSNE(all_features, all_labels, epoch, self.plot_save_path)
 
-        ret = {'Acc': epAcc, 'F1': f1, 'AUC': auc_score,
-               'precision': precision, 'recall': recall, 'Auprc': auprc}
+        # 计算按类别的准确率列表
+        if num_classes is not None:
+            per_class_acc = [
+                (correct_per_class[c] / total_per_class[c]) if total_per_class[c] > 0 else float('nan')
+                for c in range(num_classes)
+            ]
+        else:
+            per_class_acc = []
+
+        ret = {
+            'Acc': epAcc,
+            'F1': f1,
+            'AUC': auc_score,
+            'precision': precision,
+            'recall': recall,
+            'Auprc': auprc,
+            'PerClassAcc': per_class_acc
+        }
         return ret, error_cases
 
     # Function to load a pre-trained model
@@ -1748,8 +1797,16 @@ if __name__ == '__main__':
             best_epoch = -1
             best_acc = 0.0
         else:
-            result, output_str, aucMax, iteration_best_metrics, best_errors, best_epoch, best_acc = coach.run(
-                i)  # 返回最终测试得到的reses['Acc']
+            (
+                result,
+                output_str,
+                aucMax,
+                iteration_best_metrics,
+                best_errors,
+                best_epoch,
+                best_acc,
+                best_per_class_acc
+            ) = coach.run(i)  # 返回最终测试得到的reses['Acc']
 
         # 保存当前iteration的错误案例信息
         all_iteration_errors.append({
@@ -1771,6 +1828,12 @@ if __name__ == '__main__':
         results.append(result)
         aucMax_list.append(aucMax)
         outputstr_list.append(output_str)
+        # 记录每个iteration在best_epoch上的按类别ACC和各指标best值
+        if 'per_class_acc_per_iteration' not in locals():
+            per_class_acc_per_iteration = []
+            best_metric_values_per_iteration = []
+        per_class_acc_per_iteration.append(best_per_class_acc)
+        best_metric_values_per_iteration.append(iteration_best_metrics)
         for metric in coach.metrics_to_track:
             best_val = iteration_best_metrics[metric]
             best_ep = coach.best_metrics[metric]['epoch'] if best_val is not None and not np.isnan(best_val) else -1
@@ -1780,6 +1843,7 @@ if __name__ == '__main__':
         # 只有非NAN的aucMax才更新it_max
         if not np.isnan(aucMax) and aucMax > it_max:
             it_max = aucMax
+            best_iteration_index = i
             print(f"🎯 New best result updated: {it_max} at iteration {i + 1}")
 
     plt.plot(iteration_list, end_acc_list)
@@ -1835,6 +1899,34 @@ if __name__ == '__main__':
     summary_text = '\n'.join(summary_log)
     print(summary_text)
     log_file.write(summary_text + '\n')
+
+    # 在所有iteration中，选出全局best_epoch对应的按类别ACC和各指标best_ACC，并以两个list形式输出
+    try:
+        if 'best_iteration_index' in locals():
+            best_iter_idx = best_iteration_index
+        else:
+            # 如果未显式记录best_iteration_index，则默认选择第一个有效iteration
+            valid_indices = [idx for idx, a in enumerate(aucMax_list) if not np.isnan(a)]
+            best_iter_idx = valid_indices[0] if valid_indices else None
+
+        if best_iter_idx is not None:
+            best_iter_info = all_iteration_errors[best_iter_idx]
+            best_epoch_global = best_iter_info['best_epoch']
+
+            best_per_class_acc_list = per_class_acc_per_iteration[best_iter_idx] if 'per_class_acc_per_iteration' in locals() else None
+            best_metric_value_dict = best_metric_values_per_iteration[best_iter_idx] if 'best_metric_values_per_iteration' in locals() else None
+
+            if best_per_class_acc_list is not None:
+                print(f"\nPer-class ACC at global best_epoch (iteration {best_iter_idx + 1}, epoch {best_epoch_global}):")
+                print(list(best_per_class_acc_list))
+
+            if best_metric_value_dict is not None:
+                metric_order = coach.metrics_to_track
+                best_metric_value_list = [best_metric_value_dict.get(met, float('nan')) for met in metric_order]
+                print("\nBest metric values at global best_epoch (ordered as Acc, F1, AUC, precision, recall, Auprc):")
+                print(best_metric_value_list)
+    except Exception as e:
+        print(f"⚠️ Failed to compute per-class ACC and best metric lists: {e}")
 
     if len(coach.iteration_two_hop_stats) > 0:
         print(f"\n🏆 All Iterations Two-hop Neighbor Statistics Summary:")
