@@ -231,6 +231,10 @@ class Coach:
         # iteration级别的统计（存储每个iteration的平均值）
         self.iteration_two_hop_stats = []
 
+        # 全局最佳ACC（跨所有iteration与epoch）
+        self.best_global_acc = float('-inf')
+        self.best_global_info = None
+
         # 新增：从预处理缓存加载基因邻接关系用于二跳邻居查找
         print("Loading gene-gene adjacency matrix from preprocessed cache...")
         drug_gene_dict, gene_neighbors = load_drug_gene_dict()
@@ -409,6 +413,17 @@ class Coach:
                     best_errors_in_iteration = error_cases
                     best_per_class_acc_in_iteration = reses.get('PerClassAcc', None)
 
+                # 更新跨所有iteration与epoch的全局最佳ACC模型
+                if reses['Acc'] > self.best_global_acc:
+                    self.best_global_acc = reses['Acc']
+                    self.best_global_info = {
+                        'iteration': config.get('iteration', i + 1),
+                        'epoch': ep,
+                        'Acc': reses['Acc']
+                    }
+                    # 始终将全局最佳ACC模型保存为 best_acc.pkl
+                    self.save_model('best_acc')
+
                 # 记录测试结果
                 log(self.makePrint('Test', ep, reses, tstFlag))
                 update_best_metrics(reses, ep)
@@ -427,13 +442,20 @@ class Coach:
         log(self.makePrint('Test', args.epoch, reses, True))
         update_best_metrics(reses, args.epoch)
 
-        # 如果最终测试的ACC更高，更新最佳错误案例
+        # 如果最终测试的ACC更高，更新最佳错误案例以及全局最佳模型
         if reses['Acc'] > best_acc_in_iteration:
             best_acc_in_iteration = reses['Acc']
             best_errors_in_iteration = final_error_cases
             best_per_class_acc_in_iteration = reses.get('PerClassAcc', None)
 
-        self.save_model('{}'.format(config['iteration']))
+        if reses['Acc'] > self.best_global_acc:
+            self.best_global_acc = reses['Acc']
+            self.best_global_info = {
+                'iteration': config.get('iteration', i + 1),
+                'epoch': args.epoch,
+                'Acc': reses['Acc']
+            }
+            self.save_model('best_acc')
 
         # 计算当前iteration的二跳邻居统计
         total_iteration_samples = sum(self.two_hop_stats.values())
@@ -1666,27 +1688,67 @@ class Coach:
 
     # Function to load a pre-trained model
     def loadModel(self):
-        # 处理DataParallel包装的模型加载
+        """
+        加载已经训练好的模型权重。
+        - 目录结构（相对项目根目录）: Models/ckl/<dataset>/
+        - 文件名: <args.load_model>.pkl  （例如: best_acc.pkl）
+        """
+        # 计算模型目录（相对路径 + 绝对路径，仅绝对路径用于实际读写和日志）
+        code_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(code_dir, '..'))
+        rel_model_dir = os.path.join('Models', 'ckl', str(args.data))
+        abs_model_dir = os.path.join(project_root, rel_model_dir)
+
+        # 构造检查点文件名
+        ckpt_name = args.load_model
+        if not ckpt_name.endswith('.pkl'):
+            ckpt_name = ckpt_name + '.pkl'
+        ckpt_path = os.path.join(abs_model_dir, ckpt_name)
+
+        # 实际加载
+        state_dict = t.load(ckpt_path, map_location=args.device)
         if self.is_data_parallel:
-            self.model.module.load_state_dict(t.load('../Models/' + args.load_model + '.pkl'))
+            self.model.module.load_state_dict(state_dict)
         else:
-            self.model.load_state_dict(t.load('../Models/' + args.load_model + '.pkl'))
+            self.model.load_state_dict(state_dict)
         self.opt = t.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=0)
-        log('Model Loaded')
+
+        load_msg = f"Model Loaded from: {os.path.abspath(ckpt_path)}"
+        print(load_msg)
+        log(load_msg)
+        if self.log_file:
+            self.log_file.write(load_msg + '\n')
 
     # Function to save the trained model
     def save_model(self, model_path):
-        # 使用 wandb.run.dir 获取当前 WandB 实验的根目录
-        model_parent_path = "D:\\桌面\\研\\论文\\实验代码\\DGCL-main\\DGCL-main\\Models"
-        # model_parent_path = os.path.join(wandb.run.dir, 'ckl')
-        # if not os.path.exists(model_parent_path):
-        #     os.mkdir(model_parent_path)
-        # # 将模型参数保存到指定的模型路径上（网络层的权重、偏置）
-        # # 处理DataParallel包装的模型保存
-        # if self.is_data_parallel:
-        #     t.save(self.model.module.state_dict(), '{}/{}_model.pkl'.format(model_parent_path, model_path))
-        # else:
-        #     t.save(self.model.state_dict(), '{}/{}_model.pkl'.format(model_parent_path, model_path))
+        """
+        保存当前模型为给定名称的检查点。
+        - 相对目录: Models/ckl/<dataset>/
+        - 实际保存文件名: <model_path>.pkl  （示例: best_acc.pkl, iter1_best.pkl）
+        注意: 代码内部使用相对目录构造，日志中输出绝对路径。
+        """
+        code_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(code_dir, '..'))
+        rel_model_dir = os.path.join('Models', 'ckl', str(args.data))
+        abs_model_dir = os.path.join(project_root, rel_model_dir)
+        os.makedirs(abs_model_dir, exist_ok=True)
+
+        ckpt_name = model_path
+        if not ckpt_name.endswith('.pkl'):
+            ckpt_name = ckpt_name + '.pkl'
+        ckpt_path = os.path.join(abs_model_dir, ckpt_name)
+
+        # 处理DataParallel包装的模型保存
+        if self.is_data_parallel:
+            t.save(self.model.module.state_dict(), ckpt_path)
+        else:
+            t.save(self.model.state_dict(), ckpt_path)
+
+        save_msg = f"Model checkpoint saved to: {os.path.abspath(ckpt_path)}"
+        print(save_msg)
+        log(save_msg)
+        if self.log_file:
+            self.log_file.write(save_msg + '\n')
 
 
 # Main execution block
@@ -1783,7 +1845,7 @@ if __name__ == '__main__':
     aucMax = 0
     overall_iteration_best = {met: [] for met in coach.metrics_to_track}
     best_epochs_per_metric = {met: [] for met in coach.metrics_to_track}
-    all_iteration_errors = []  # 新增：存储每个iteration的错误案例
+    all_iteration_errors = []  # 新增：存储每个iteration的错误案例（可通过超参数控制是否启用）
 
     for i in range(args.iteration):
         print('{}-th iteration'.format(i + 1))
@@ -1808,13 +1870,14 @@ if __name__ == '__main__':
                 best_per_class_acc
             ) = coach.run(i)  # 返回最终测试得到的reses['Acc']
 
-        # 保存当前iteration的错误案例信息
-        all_iteration_errors.append({
-            'iteration': i + 1,
-            'best_epoch': best_epoch,
-            'best_acc': best_acc,
-            'error_cases': best_errors
-        })
+        # 保存当前iteration的错误案例信息（可关闭）
+        if getattr(args, 'enable_error_logging', False):
+            all_iteration_errors.append({
+                'iteration': i + 1,
+                'best_epoch': best_epoch,
+                'best_acc': best_acc,
+                'error_cases': best_errors
+            })
 
         # 处理NAN结果：记录但继续下一个iteration
         if np.isnan(result):
@@ -1900,33 +1963,63 @@ if __name__ == '__main__':
     print(summary_text)
     log_file.write(summary_text + '\n')
 
-    # 在所有iteration中，选出全局best_epoch对应的按类别ACC和各指标best_ACC，并以两个list形式输出
-    try:
-        if 'best_iteration_index' in locals():
-            best_iter_idx = best_iteration_index
-        else:
-            # 如果未显式记录best_iteration_index，则默认选择第一个有效iteration
-            valid_indices = [idx for idx, a in enumerate(aucMax_list) if not np.isnan(a)]
-            best_iter_idx = valid_indices[0] if valid_indices else None
+    # 在所有iteration中，输出：
+    # 1）全局best_epoch上，各类别的ACC（一个list）
+    # 2）每个类别在所有iteration中的全局最佳ACC（一个list）
+    if getattr(args, 'enable_error_logging', False) and len(all_iteration_errors) > 0:
+        try:
+            if 'best_iteration_index' in locals():
+                best_iter_idx = best_iteration_index
+            else:
+                # 如果未显式记录best_iteration_index，则默认选择第一个有效iteration
+                valid_indices = [idx for idx, a in enumerate(aucMax_list) if not np.isnan(a)]
+                best_iter_idx = valid_indices[0] if valid_indices else None
 
-        if best_iter_idx is not None:
-            best_iter_info = all_iteration_errors[best_iter_idx]
-            best_epoch_global = best_iter_info['best_epoch']
+            if best_iter_idx is not None:
+                best_iter_info = all_iteration_errors[best_iter_idx]
+                best_epoch_global = best_iter_info['best_epoch']
 
-            best_per_class_acc_list = per_class_acc_per_iteration[best_iter_idx] if 'per_class_acc_per_iteration' in locals() else None
-            best_metric_value_dict = best_metric_values_per_iteration[best_iter_idx] if 'best_metric_values_per_iteration' in locals() else None
+                best_per_class_acc_list = (
+                    per_class_acc_per_iteration[best_iter_idx]
+                    if 'per_class_acc_per_iteration' in locals() else None
+                )
 
-            if best_per_class_acc_list is not None:
-                print(f"\nPer-class ACC at global best_epoch (iteration {best_iter_idx + 1}, epoch {best_epoch_global}):")
-                print(list(best_per_class_acc_list))
+                if best_per_class_acc_list is not None:
+                    # ① 全局best_epoch上，各类别ACC列表
+                    print(f"\nPer-class ACC at global best_epoch (iteration {best_iter_idx + 1}, epoch {best_epoch_global}):")
+                    print(list(best_per_class_acc_list))
 
-            if best_metric_value_dict is not None:
-                metric_order = coach.metrics_to_track
-                best_metric_value_list = [best_metric_value_dict.get(met, float('nan')) for met in metric_order]
-                print("\nBest metric values at global best_epoch (ordered as Acc, F1, AUC, precision, recall, Auprc):")
-                print(best_metric_value_list)
-    except Exception as e:
-        print(f"⚠️ Failed to compute per-class ACC and best metric lists: {e}")
+                # ② 每个类别在所有iteration中的全局最佳ACC
+                if 'per_class_acc_per_iteration' in locals() and len(per_class_acc_per_iteration) > 0:
+                    # 找到第一个非空的按类别ACC列表，确定类别数
+                    first_valid = None
+                    for per_cls in per_class_acc_per_iteration:
+                        if per_cls is not None:
+                            first_valid = per_cls
+                            break
+                    if first_valid is not None:
+                        num_classes = len(first_valid)
+                        global_best_per_class = [float('-inf')] * num_classes
+
+                        for per_cls in per_class_acc_per_iteration:
+                            if per_cls is None:
+                                continue
+                            for c, v in enumerate(per_cls):
+                                if v is None or np.isnan(v):
+                                    continue
+                                if v > global_best_per_class[c]:
+                                    global_best_per_class[c] = v
+
+                        # 将仍为 -inf 的位置置为 NaN，表示该类别没有有效记录
+                        global_best_per_class = [
+                            (val if val != float('-inf') else float('nan'))
+                            for val in global_best_per_class
+                        ]
+
+                        print("\nGlobal best ACC for each class across all iterations:")
+                        print(global_best_per_class)
+        except Exception as e:
+            print(f"⚠️ Failed to compute per-class ACC and best metric lists: {e}")
 
     if len(coach.iteration_two_hop_stats) > 0:
         print(f"\n🏆 All Iterations Two-hop Neighbor Statistics Summary:")
@@ -2026,8 +2119,9 @@ if __name__ == '__main__':
 
     save_results_to_log(overall_iteration_best, coach)
 
-    # 输出错误案例到日志和CSV文件
-    log_all_error_cases(all_iteration_errors, log_file, log_filepath)
+    # 输出错误案例到日志和CSV文件（可通过超参数控制）
+    if getattr(args, 'enable_error_logging', False) and len(all_iteration_errors) > 0:
+        log_all_error_cases(all_iteration_errors, log_file, log_filepath)
 
     log_file.close()
     print(f"📝 日志文件已关闭: {log_filepath}")
