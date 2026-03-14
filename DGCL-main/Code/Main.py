@@ -200,6 +200,8 @@ class Coach:
         self.handler = handler
         self.drug_gene_dict = drug_gene_dict
         self.log_file = log_file
+        # 仅在第一次保存模型时输出一次模型路径
+        self._model_save_path_logged = False
 
         print('DRUG    ', args.drug, 'GENE', args.gene)
         # 数据集长度等价于DGI的长度
@@ -1744,11 +1746,14 @@ class Coach:
         else:
             t.save(self.model.state_dict(), ckpt_path)
 
-        save_msg = f"Model checkpoint saved to: {os.path.abspath(ckpt_path)}"
-        print(save_msg)
-        log(save_msg)
-        if self.log_file:
-            self.log_file.write(save_msg + '\n')
+        # 只在本进程第一次保存模型时输出一次保存路径，避免日志中重复刷屏
+        if not self._model_save_path_logged:
+            save_msg = f"Model checkpoint saved to: {os.path.abspath(ckpt_path)}"
+            print(save_msg)
+            log(save_msg)
+            if self.log_file:
+                self.log_file.write(save_msg + '\n')
+            self._model_save_path_logged = True
 
 
 # Main execution block

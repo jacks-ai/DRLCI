@@ -37,29 +37,6 @@ class GatedConcatFusion(nn.Module):
         return fused_embeds
 
 
-class JointGatedFusion(nn.Module):
-    """
-    联合编码专用门控层：对 pair 级的 joint 文本向量做特征级门控，
-    门控权重由 (struct_d, struct_g, joint_embed) 共同决定。 加了这个门控拟合慢一些了
-    """
-    def __init__(self, latdim):
-        super(JointGatedFusion, self).__init__()
-        self.input_dim = latdim * 3
-        self.output_dim = latdim
-        self.ln = nn.LayerNorm(self.input_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(self.input_dim, self.input_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.input_dim // 2, self.output_dim),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, struct_d, struct_g, joint_embed):
-        combined = t.cat([struct_d, struct_g, joint_embed], dim=1)
-        weights = self.gate(self.ln(combined))
-        return joint_embed * weights
-
-
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
@@ -100,9 +77,7 @@ class Model(nn.Module):
         nn.init.xavier_uniform_(self.joint_text_proj.weight)
         self.register_buffer('joint_embeds_train', joint_train)
         self.register_buffer('joint_embeds_test', joint_test)
-        # 针对联合编码的样本级门控层
-        self.joint_fusion_layer = JointGatedFusion(args.latdim)
-        print(f"  训练联合嵌入路径: {args.joint_embed_train_path}, 测试: {args.joint_embed_test_path}")
+        print(f"  训练联合嵌入路径: {args.joint_embed_train_path}, 测试: {args.joint_embed_test_path}，，，，，，，，，，，，，，")
         print(f"  训练联合嵌入: {joint_train.shape}, 测试: {joint_test.shape}, 投影 -> {args.latdim}")
 
     def _init_entity_embeddings(self, args):
@@ -121,7 +96,6 @@ class Model(nn.Module):
         self.fusion_layer = GatedConcatFusion(args.latdim)
         print("Gated Concat 融合模块已初始化.")
 
-    #  这里只有图结构，做文本联合嵌入不好做
     def forward(self, adj, keepRate):
         # 步骤 3: GCN 传播 (结构视图)
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
@@ -176,8 +150,6 @@ class Model(nn.Module):
             row_indices = t.tensor(row_indices, dtype=t.long, device=embeds.device)
             batch_joint = self.joint_embeds_train.to(embeds.device)[row_indices]
             batch_joint = F.normalize(self.joint_text_proj(batch_joint), p=2, dim=1)
-            # 样本级门控：根据结构特征调整联合文本向量
-            batch_joint = self.joint_fusion_layer(struct_d, struct_g, batch_joint)
             pre = self.classifierLayer(struct_d, struct_g, batch_joint)
         else:
             dEmbeds = embeds[:args.drug][drugs]
@@ -194,7 +166,7 @@ class Model(nn.Module):
         return ceLoss, sslLoss
 
     def predict(self, adj, drugs, genes):
-        embeds, struct_view, _ = self.forward(adj, 1.0) # 返回融合嵌入，结构嵌入，文本嵌入
+        embeds, struct_view, _ = self.forward(adj, 1.0)
         if self.use_joint_encoding:
             struct_d = struct_view[:args.drug][drugs]
             struct_g = struct_view[args.drug:][genes]
@@ -202,7 +174,6 @@ class Model(nn.Module):
             row_indices = t.tensor(row_indices, dtype=t.long, device=embeds.device)
             batch_joint = self.joint_embeds_test.to(embeds.device)[row_indices]
             batch_joint = F.normalize(self.joint_text_proj(batch_joint), p=2, dim=1)
-            batch_joint = self.joint_fusion_layer(struct_d, struct_g, batch_joint)  # 先降维再融合
             pre = self.classifierLayer(struct_d, struct_g, batch_joint)
         else:
             dEmbeds = embeds[:args.drug][drugs]
