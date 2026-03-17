@@ -10,13 +10,12 @@ init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
 
-# --- 新增：特征级门控拼接层 (Feature-wise Gated Concatenation) ---
+# --- 新增：特征级门控拼接层 (用于实体级文本融合) ---
 class GatedConcatFusion(nn.Module):
     def __init__(self, latdim):
         super(GatedConcatFusion, self).__init__()
         self.output_dim = latdim * 2
 
-        # 【新增修复】加入 LayerNorm，强制稳定输入分布
         self.ln = nn.LayerNorm(self.output_dim)
 
         self.gate = nn.Sequential(
@@ -28,13 +27,31 @@ class GatedConcatFusion(nn.Module):
 
     def forward(self, struct_feat, text_feat):
         combined = t.cat([struct_feat, text_feat], dim=1)
-
-        # 先过 LayerNorm 再进 Gate 计算权重
-        # 这样即使 combined 有点大，算权重的网络也不会崩
         weights = self.gate(self.ln(combined))
-
         fused_embeds = combined * weights
         return fused_embeds
+
+class JointGatedFusion(nn.Module):
+    """
+    联合编码专用门控层：对 pair 级的 joint 文本向量做特征级门控，
+    门控权重由 (struct_d, struct_g, joint_embed) 共同决定。 加了这个门控拟合慢一些了
+    """
+    def __init__(self, latdim):
+        super(JointGatedFusion, self).__init__()
+        self.input_dim = latdim * 3
+        self.output_dim = latdim
+        self.ln = nn.LayerNorm(self.input_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(self.input_dim, self.input_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.input_dim // 2, self.output_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, struct_d, struct_g, joint_embed):
+        combined = t.cat([struct_d, struct_g, joint_embed], dim=1)
+        weights = self.gate(self.ln(combined))
+        return joint_embed * weights
 
 
 class Model(nn.Module):
@@ -49,7 +66,9 @@ class Model(nn.Module):
         self.use_joint_encoding = getattr(args, 'use_joint_encoding', False)
         self.use_text_features = False
         if args.use_llm_embeddings:
-            if self.use_joint_encoding and getattr(args, 'joint_embed_train_path', None) and getattr(args, 'joint_embed_test_path', None):
+            if self.use_joint_encoding and getattr(args, 'joint_embed_train_path', None) and getattr(args,
+                                                                                                     'joint_embed_test_path',
+                                                                                                     None):
                 self.use_text_features = True
                 self._init_joint_embeddings(args)
             elif not self.use_joint_encoding and args.pretrained_drug_embed_path and args.pretrained_gene_embed_path:
@@ -156,13 +175,7 @@ class Model(nn.Module):
             gEmbeds = embeds[args.drug:][genes]
             pre = self.classifierLayer(dEmbeds, gEmbeds)
         ceLoss = ce(pre, labels)
-        sslLoss=0
-        # 没有用
-        # if self.use_text_features:
-        #     alpha = 0.0000001
-        #     sslLoss = contrastLoss(struct_view[drugs], text_view[drugs],args.temp) + \
-        #               contrastLoss(struct_view[genes], text_view[genes],args.temp)
-        #     sslLoss = sslLoss*alpha
+        sslLoss = 0
         return ceLoss, sslLoss
 
     def predict(self, adj, drugs, genes):
@@ -225,22 +238,34 @@ class ClassifierLayer(nn.Module):
     def __init__(self):
         super(ClassifierLayer, self).__init__()
         input_dim = args.latdim
-        # 联合编码: (struct_d, struct_g, joint_proj) -> latdim*3；实体级: (d, g) 各 latdim*2 -> latdim*4；仅结构: latdim*2
+
+        # 联合编码: (struct_d, struct_g, joint_proj) -> latdim*3；实体级: (d, g) -> latdim*4；仅结构: latdim*2
         if getattr(args, 'use_joint_encoding', False):
             classifier_input_dim = input_dim * 3
+            # 【代码可维护性优化】：在这里实例化联合编码专用门控
+            print("使用JointGatedFusion 门控进行融合")
+            self.joint_fusion = JointGatedFusion(input_dim)
         elif args.use_llm_embeddings:
             classifier_input_dim = input_dim * 4
+            self.joint_fusion = None
         else:
             classifier_input_dim = input_dim * 2
+            self.joint_fusion = None
 
         self.lin1 = nn.Linear(classifier_input_dim, 128)
         self.lin2 = nn.Linear(128, args.num_classes)
 
     def forward(self, dEmbeds, gEmbeds, joint_embed=None):
         if joint_embed is not None:
-            embeds = t.cat((dEmbeds, gEmbeds, joint_embed), dim=1)
+            # 【平滑替换】：如果启用了门控融合，就走门控；否则退回原始的暴力拼接
+            if self.joint_fusion is not None:
+                joint_embed = self.joint_fusion(dEmbeds, gEmbeds, joint_embed)
+                embeds = t.cat((dEmbeds, gEmbeds, joint_embed), dim=1)
+            else:
+                embeds = t.cat((dEmbeds, gEmbeds, joint_embed), dim=1)
         else:
             embeds = t.cat((dEmbeds, gEmbeds), dim=1)
+
         embeds = F.relu(self.lin1(embeds))
         embeds = F.dropout(embeds, p=0.4, training=self.training)
         return self.lin2(embeds)
