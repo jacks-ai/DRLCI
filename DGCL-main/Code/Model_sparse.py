@@ -3,11 +3,37 @@ from torch import nn
 from Params import args
 from Utils.Utils import contrastLoss, ce, l2_norm, calcRegLoss
 import numpy as np
-import torch_sparse
 import torch.nn.functional as F
 
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
+
+
+class SELayer(nn.Module):
+    """Squeeze-Excitation 式通道门控（与 temp.py 一致），对节点特征逐维重标定。"""
+
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        reduced = max(1, channel // reduction)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, reduced, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channel, bias=False),
+            nn.Sigmoid(),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for layer in self.fc:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, mode="fan_out", nonlinearity="relu")
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        b, c = x.size()
+        y = self.fc(x).view(b, c)
+        return x * y.expand_as(x)
 
 
 # --- 新增：特征级门控拼接层 (用于实体级文本融合) ---
@@ -81,8 +107,13 @@ class Model(nn.Module):
         self.train_pair_to_row = None
         self.test_pair_to_row = None
 
-        # GCN / 分类器 / DropEdge（所有分支共用）
-        self.gcnLayers = nn.Sequential(*[GCNLayer() for i in range(args.gnn_layer)])
+        # 图传播：由对称归一化 spmm（固定度权重）改为与 temp.Causal_GraphConvolution 一致的注意力聚合（可学习不等权）
+        attn_dropout = getattr(args, 'gat_dropout', 0.0)
+        self.gcnLayers = nn.Sequential(
+            *[GraphAttentionConvolution(args.latdim, args.latdim, dropout=attn_dropout) for _ in range(args.gnn_layer)]
+        )
+        se_reduction = getattr(args, 'se_reduction', 16)
+        self.seLayer = SELayer(args.latdim, reduction=se_reduction)
         self.classifierLayer = ClassifierLayer()
         self.edgeDropper = SpAdjDropEdge()
 
@@ -121,7 +152,11 @@ class Model(nn.Module):
         embedsLst = [struct_embeds]
 
         for gcn in self.gcnLayers:
-            struct_embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            gcn_emb = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
+            se_out = self.seLayer(gcn_emb)
+            adjusted = t.add(gcn_emb, se_out)
+            adjusted1 = t.add(gcn_emb, embedsLst[-1])
+            struct_embeds = t.add(adjusted, adjusted1)
             embedsLst.append(struct_embeds)
 
         final_struct_embeds = sum(embedsLst)
@@ -144,7 +179,11 @@ class Model(nn.Module):
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
         for gcn in self.gcnLayers:
-            embeds = gcn(adj, embedsLst[-1])
+            gcn_emb = gcn(adj, embedsLst[-1])
+            se_out = self.seLayer(gcn_emb)
+            adjusted = t.add(gcn_emb, se_out)
+            adjusted1 = t.add(gcn_emb, embedsLst[-1])
+            embeds = t.add(adjusted, adjusted1)
             embedsLst.append(embeds)
         final_struct_embeds = sum(embedsLst)
 
@@ -196,6 +235,7 @@ class Model(nn.Module):
 
     def getEmbeds(self):
         self.unfreeze(self.gcnLayers)
+        self.unfreeze(self.seLayer)
         return t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
     def unfreeze(self, layer):
@@ -207,15 +247,41 @@ class Model(nn.Module):
         return self.gcnLayers
 
 
-class GCNLayer(nn.Module):
-    def __init__(self):
-        super(GCNLayer, self).__init__()
+class GraphAttentionConvolution(nn.Module):
+    """
+    与 temp.py 中 Causal_GraphConvolution 相同的注意力机制：a、[Wh_i||Wh_j] 式打分 + 邻接掩码 + softmax，
+    用学习到的权重对邻居做不等权聚合。不包含因果干预掩码，也不在注意力之后再乘一遍 adj（单次聚合）。
+    """
+
+    def __init__(self, in_features, out_features, dropout=0.0, score_act=F.relu):
+        super(GraphAttentionConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.a = nn.Parameter(t.empty(size=(2 * out_features, 1)))
+        self.dropout = dropout
+        self.score_act = score_act
+        self.weight = nn.Parameter(t.FloatTensor(in_features, out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        t.nn.init.xavier_uniform_(self.weight)
+        t.nn.init.xavier_uniform_(self.a)
 
     def forward(self, adj, embeds, flag=True):
-        if (flag):
-            return t.spmm(adj, embeds)
-        else:
-            return torch_sparse.spmm(adj.indices(), adj.values(), adj.shape[0], adj.shape[1], embeds)
+        embeds = F.dropout(embeds, self.dropout, training=self.training)
+        Wh = t.mm(embeds, self.weight)
+        Wh1 = t.matmul(Wh, self.a[: self.out_features, :])
+        Wh2 = t.matmul(Wh, self.a[self.out_features :, :])
+        e = Wh1 + Wh2.T
+        e = self.score_act(e)
+
+        zero_vec = -5e4 * t.ones_like(e)
+        adj_dense = adj.to_dense() if adj.is_sparse else adj
+        attention = t.where(adj_dense > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+        h_prime = t.matmul(attention, Wh)
+        return h_prime
 
 
 class SpAdjDropEdge(nn.Module):

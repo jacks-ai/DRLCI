@@ -80,8 +80,8 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
             csv_writer = csv.writer(csvfile)
 
             # 动态生成CSV表头（包含概率分布列）
-            header = ['Iteration', 'Best_Epoch', 'Best_ACC', '药物ID', '基因ID', 
-                     '预测标签', '真实标签', '最大概率', '预测类概率', '真实类概率']
+            header = ['Iteration', 'Best_Epoch', 'Best_ACC', '药物ID', '基因ID',
+                      '预测标签', '真实标签', '最大概率', '预测类概率', '真实类概率']
             if num_classes > 0:
                 header.extend([f'类别{i}概率' for i in range(num_classes)])
             csv_writer.writerow(header)
@@ -144,7 +144,7 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
     all_max_probs = []
     all_predicted_probs = []
     all_actual_probs = []
-    
+
     # 为每个iteration添加简要统计
     for iter_info in all_iteration_errors:
         iteration = iter_info['iteration']
@@ -154,17 +154,17 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
 
         error_log.append(f"\nIteration {iteration} - Best Epoch: {best_epoch} - ACC: {best_acc:.4f}")
         error_log.append(f"  错误案例数: {len(error_cases)}")
-        
+
         # 统计该iteration的概率信息
         if len(error_cases) > 0:
             iter_max_probs = [case.get('max_prob', 0) for case in error_cases]
             iter_pred_probs = [case.get('predicted_prob', 0) for case in error_cases]
             iter_actual_probs = [case.get('actual_prob', 0) for case in error_cases]
-            
+
             all_max_probs.extend(iter_max_probs)
             all_predicted_probs.extend(iter_pred_probs)
             all_actual_probs.extend(iter_actual_probs)
-            
+
             error_log.append(f"  平均最大概率: {np.mean(iter_max_probs):.4f}")
             error_log.append(f"  平均预测类概率: {np.mean(iter_pred_probs):.4f}")
             error_log.append(f"  平均真实类概率: {np.mean(iter_actual_probs):.4f}")
@@ -176,7 +176,7 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
     error_log.append(f"总Iteration数: {len(all_iteration_errors)}")
     error_log.append(f"总错误案例数: {total_errors}")
     error_log.append(f"平均每个Iteration错误数: {avg_errors:.2f}")
-    
+
     # 添加概率分布统计
     if len(all_max_probs) > 0:
         error_log.append(f"\n📈 概率分布统计（所有错误案例）:")
@@ -186,7 +186,7 @@ def log_all_error_cases(all_iteration_errors, log_file, log_filepath):
         error_log.append(f"  最大概率范围: [{np.min(all_max_probs):.4f}, {np.max(all_max_probs):.4f}]")
         error_log.append(f"  预测类概率范围: [{np.min(all_predicted_probs):.4f}, {np.max(all_predicted_probs):.4f}]")
         error_log.append(f"  真实类概率范围: [{np.min(all_actual_probs):.4f}, {np.max(all_actual_probs):.4f}]")
-    
+
     error_log.append("=" * 60 + "\n")
 
     error_text = '\n'.join(error_log)
@@ -544,7 +544,7 @@ class Coach:
         self.model = Model().cuda()
         mode_msg = "模型模式：联合编码文本 + 结构特征" if getattr(self.model, 'use_joint_encoding', False) \
             else ("模型模式：实体级LLM文本嵌入 + 结构特征" if getattr(self.model, 'use_text_features', False) \
-                 else "模型模式：仅使用结构嵌入")
+                      else "模型模式：仅使用结构嵌入")
         print(mode_msg)
         log(mode_msg)
         if self.log_file:
@@ -1483,14 +1483,19 @@ class Coach:
                 # bpr_loss_value = hard_loss_value
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
                 if current_epoch == 0 and i == 0:
-                    print(f"Positive scores shape: {posScores.shape}, mean: {float(posScores.mean().detach().item()):.4f}")
-                    print(f"Hard negative scores shape: {hard_negScores.shape}, mean: {float(hard_negScores.mean().detach().item()):.4f}")
-                    print(f"Common negative scores shape: {negScores.shape}, mean: {float(negScores.mean().detach().item()):.4f}")
+                    print(
+                        f"Positive scores shape: {posScores.shape}, mean: {float(posScores.mean().detach().item()):.4f}")
+                    print(
+                        f"Hard negative scores shape: {hard_negScores.shape}, mean: {float(hard_negScores.mean().detach().item()):.4f}")
+                    print(
+                        f"Common negative scores shape: {negScores.shape}, mean: {float(negScores.mean().detach().item()):.4f}")
                     print(f"Score difference (scoreDiff1) mean: {float(scoreDiff1.mean().detach().item()):.4f}")
                     print(f"Weighted score difference mean: {float(weighted_scoreDiff1.mean().detach().item()):.4f}")
                     print(f"Average weight per sample: {float(neg_weights.mean().detach().item()):.4f}")
-                    print(f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
-                    print(f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
+                    print(
+                        f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
+                    print(
+                        f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
 
                 # 梯度累积但分别控制 - 避免损失值差异过大的影响
                 regLoss = calcRegLoss(self.model) * args.reg
@@ -1521,7 +1526,8 @@ class Coach:
                     print(f"  Hard loss: {float(hard_loss_value.detach().item()):.4f}")
                     ratio = float((neg_loss_value / (hard_loss_value + 1e-12)).detach().item())
                     print(f"  Common neg loss: {float(neg_loss_value.detach().item()):.4f} (ratio: {ratio:.1f}x)")
-                    print(f"  Weighted common loss: {float((neg_loss_value * args.common_neg_weight).detach().item()):.4f}")
+                    print(
+                        f"  Weighted common loss: {float((neg_loss_value * args.common_neg_weight).detach().item()):.4f}")
                     print(f"  Total loss: {float(total_loss.detach().item()):.4f}")
                     print(f"  Reg loss (split): {float(regLoss.detach().item()):.4f} (0.5 each)")
 
@@ -1608,7 +1614,7 @@ class Coach:
                     max_prob = np.max(prob_dist)
                     predicted_class = pre_cpu[idx].item()
                     actual_class = labels_cpu[idx].item()
-                    
+
                     error_cases.append({
                         'drug': drugs_cpu[idx].item(),
                         'gene': genes_cpu[idx].item(),
@@ -1631,9 +1637,11 @@ class Coach:
             epAcc = accuracy_score(labels_cpu, pre_cpu)
             # zero_division=0  用于处理 “分母为零”导致指标无法计算 的情况
             if args.data == 'DGIdb':
-                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='weighted', zero_division=0)
+                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='weighted',
+                                                                           zero_division=0)
             else:
-                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='binary', zero_division=0)
+                precision, recall, f1, _ = precision_recall_fscore_support(labels_cpu, pre_cpu, average='binary',
+                                                                           zero_division=0)
             labels_list.append(labels_cpu.numpy())
             probs_list.append(probs_cpu)
 
@@ -1999,7 +2007,8 @@ if __name__ == '__main__':
 
                 if best_per_class_acc_list is not None:
                     # ① 全局best_epoch上，各类别ACC列表
-                    print(f"\nPer-class ACC at global best_epoch (iteration {best_iter_idx + 1}, epoch {best_epoch_global}):")
+                    print(
+                        f"\nPer-class ACC at global best_epoch (iteration {best_iter_idx + 1}, epoch {best_epoch_global}):")
                     print(list(best_per_class_acc_list))
 
                 # ② 每个类别在所有iteration中的全局最佳ACC
