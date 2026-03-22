@@ -58,7 +58,7 @@ def create_global_ids(args):
     }
 
     output_dir = os.path.join(args.data_dir, args.data)
-    output_path = os.path.join(output_dir, 'global_ids_2.json')
+    output_path = os.path.join(output_dir, 'global_ids_DGIdb.json')  # global_ids_2.json
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
