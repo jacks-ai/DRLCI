@@ -35,12 +35,14 @@ def create_global_ids(args):
     print("\n[2/3] 提取、去重并排序ID...")
 
     # 提取药物ID（第0列）和基因ID（第1列）
+    # 排序规则与 DataHandler.map_data 一致：
+    # - 药物: DataHandler 中 d_nodes 为 np.str_，使用字符串排序
+    # - 基因: DataHandler 中 g_nodes 为 np.int32，使用数值排序
     all_drug_ids = pd.unique(df_combined[0].astype(str)).tolist()
-    all_gene_ids = pd.unique(df_combined[1].astype(str)).tolist()
-
-    # 排序以确保顺序确定性
     all_drug_ids.sort()
-    all_gene_ids.sort()
+
+    all_gene_ids_raw = pd.unique(df_combined[1]).tolist()
+    all_gene_ids = [str(g) for g in sorted(all_gene_ids_raw, key=lambda x: int(x))]  # JSON 保存为字符串
 
     drug_checksum = compute_checksum(all_drug_ids)
     gene_checksum = compute_checksum(all_gene_ids)
@@ -56,7 +58,7 @@ def create_global_ids(args):
     }
 
     output_dir = os.path.join(args.data_dir, args.data)
-    output_path = os.path.join(output_dir, 'global_ids.json')
+    output_path = os.path.join(output_dir, 'global_ids_2.json')
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
