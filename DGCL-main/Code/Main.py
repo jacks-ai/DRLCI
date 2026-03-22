@@ -1257,6 +1257,46 @@ class Coach:
 
         return sorted_indices, sorted_scores
 
+    def build_intervention_mask(self, drugs_batch, hard_negatives_batch, neg_weights, bipartite_pair_accumulator=None):
+        """
+        因果干预掩码：仅对「一跳困难负样本」对应的药物–基因边做 do 干预（mask=0）；
+        二跳困难负样本不干预，保持图中注意力可达。
+        困难负样本损失仍使用完整 mixed_hard_negatives + neg_weights（本函数不参与损失，只建掩码）。
+
+        一跳/二跳的区分依赖 neg_weights：采样侧先填一跳再填二跳，且分别赋 one_hop_weight / two_hop_weight。
+        仅当 wj 与 one_hop_weight 一致且与 two_hop_weight 可区分时才掩码，避免两权重相等时误把二跳当一跳。
+
+        bipartite_pair_accumulator: 若传入 set，则对每个被干预槽位加入 (drug_idx, gene_idx)，
+        gene_idx 为物品侧基因下标 0..gene-1，用于跨 batch 去重统计二部药–基因对。
+        """
+        total_nodes = args.drug + args.gene
+        intervention_mask = t.ones(total_nodes, total_nodes, device=drugs_batch.device)
+        ow = float(args.one_hop_weight)
+        tw = float(args.two_hop_weight)
+
+        for i, drug_idx in enumerate(drugs_batch):
+            drug_idx = drug_idx.item() if hasattr(drug_idx, 'item') else int(drug_idx)
+            hard_negs = hard_negatives_batch[i]
+            w_row = neg_weights[i]
+
+            for j, hard_neg_gene in enumerate(hard_negs):
+                wj = w_row[j].item() if hasattr(w_row[j], 'item') else float(w_row[j])
+                # 仅当权重能区分一跳/二跳，且本槽位接近 one_hop、不接近 two_hop 时视为一跳
+                if abs(ow - tw) <= 1e-5:
+                    continue
+                if abs(wj - ow) > 1e-5:
+                    continue
+                if abs(wj - tw) <= 1e-5:
+                    continue
+                hard_neg_gene = hard_neg_gene.item() if hasattr(hard_neg_gene, 'item') else int(hard_neg_gene)
+                if bipartite_pair_accumulator is not None:
+                    bipartite_pair_accumulator.add((drug_idx, hard_neg_gene))
+                gene_idx_in_adj = args.drug + hard_neg_gene
+                intervention_mask[drug_idx, gene_idx_in_adj] = 0
+                intervention_mask[gene_idx_in_adj, drug_idx] = 0
+
+        return intervention_mask
+
     # Function to train a single epoch
     # 返回损失值 更新参数
     def trainEpoch(self, current_epoch, iteration_count):
@@ -1301,6 +1341,10 @@ class Coach:
         bprLoss, bpr_loss, reg_loss, regLoss, im_loss = 0, 0, 0, 0, 0
         hard_loss, common_loss = 0, 0
         loss_mult_loss = 0
+
+        # 因果干预统计（本 epoch）：一跳困难负样本对应的 (drug, gene) 在二部空间内跨 batch 去重
+        intervention_bipartite_pairs_epoch = set()
+        use_causal_mask = getattr(args, 'use_causal_intervention_mask', True)
 
         # 数据集长度
         len__ = trnLoader.dataset.__len__()
@@ -1374,7 +1418,7 @@ class Coach:
                 negScores_gene_local = innerProduct(posEmbeds.unsqueeze(1), negEmbeds_gene_local)
 
                 # 局部负样本损失：从BPR改为BCE
-                # BPR损失（已注释）:
+                # BPR损失:
                 scoreDiff_local = posScores_local - negScores_gene_local
                 if negEmbeds_drug_local is not None:
                     negScores_drug_local = innerProduct(ancEmbeds.unsqueeze(1), negEmbeds_drug_local)
@@ -1531,29 +1575,25 @@ class Coach:
                     print(f"  Total loss: {float(total_loss.detach().item()):.4f}")
                     print(f"  Reg loss (split): {float(regLoss.detach().item()):.4f} (0.5 each)")
 
-            # 计算交叉熵损失
-            ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
+            if use_causal_mask:
+                intervention_mask = self.build_intervention_mask(
+                    drugs.cpu(), mixed_hard_negatives.cpu(), neg_weights.cpu(),
+                    bipartite_pair_accumulator=intervention_bipartite_pairs_epoch,
+                )
+                intervention_mask = intervention_mask.cuda()
+            else:
+                intervention_mask = None
+
+            ceLoss, sslLoss = self.get_model().calcLosses(
+                drugs, genes, labels, self.handler.torchBiAdj, args.keepRate, intervention_mask
+            )
             regLoss = calcRegLoss(self.model) * args.reg
-            # loss = ceLoss + regLoss
             loss = ceLoss + regLoss + sslLoss
-            # 优化GPU->CPU传输
             epLoss += loss.detach().item()
             epPreLoss += ceLoss.detach().item()
-            # 清空优化器中的所有梯度，使得下一次反向传播时不会受到之前梯度的影响
             self.opt.zero_grad()
-            # 反向传播 沿着计算图计算出梯度
             loss.backward()
-            # 梯度裁剪，防止梯度爆炸
-            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=args.clip_grad_norm)
-            # 使用计算得到的梯度和学习率
-            # 使用优化算法（例如 SGD、Adam、RMSprop 等）来更新模型参数
             self.opt.step()
-            # bprLoss = 0
-
-            # 记录损失
-            # bpr_loss += float(bpr_loss_value)
-            hard_loss += hard_loss_value
-            common_loss += neg_loss_value
             reg_loss += float(regLoss)
 
         ret = dict()
@@ -1565,6 +1605,18 @@ class Coach:
         ret['regLoss'] = reg_loss / steps
         if num_neg_mul != 0:
             ret['local_neg_loss'] = loss_mult_loss / steps
+
+        if use_causal_mask and current_epoch == 0:
+            n_drug = int(args.drug)
+            n_gene = int(args.gene)
+            bipartite_cells = n_drug * n_gene
+            n_unique = len(intervention_bipartite_pairs_epoch)
+            pct_space = (n_unique / float(bipartite_cells) * 100.0) if bipartite_cells > 0 else 0.0
+            print(
+                f"📌 因果干预统计 epoch {current_epoch}: 本 epoch 至少干预过1次的药–基因对(跨 batch 去重)={n_unique}, "
+                f"占二部空间 drug×gene={n_drug}×{n_gene}={bipartite_cells} 的 {pct_space:.4f}% "
+                f"(仅一跳困难负样本槽位；二跳不干预)"
+            )
         return ret
 
     def testEpoch(self):

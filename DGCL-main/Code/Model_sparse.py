@@ -9,33 +9,6 @@ init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform
 
 
-class SELayer(nn.Module):
-    """Squeeze-Excitation 式通道门控（与 temp.py 一致），对节点特征逐维重标定。"""
-
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        reduced = max(1, channel // reduction)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, reduced, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(reduced, channel, bias=False),
-            nn.Sigmoid(),
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for layer in self.fc:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, mode="fan_out", nonlinearity="relu")
-                if layer.bias is not None:
-                    nn.init.constant_(layer.bias, 0)
-
-    def forward(self, x):
-        b, c = x.size()
-        y = self.fc(x).view(b, c)
-        return x * y.expand_as(x)
-
-
 # --- 新增：特征级门控拼接层 (用于实体级文本融合) ---
 class GatedConcatFusion(nn.Module):
     def __init__(self, latdim):
@@ -107,13 +80,11 @@ class Model(nn.Module):
         self.train_pair_to_row = None
         self.test_pair_to_row = None
 
-        # 图传播：由对称归一化 spmm（固定度权重）改为与 temp.Causal_GraphConvolution 一致的注意力聚合（可学习不等权）
+        # 图传播：GAT 注意力聚合（可学习不等权）；可选因果干预掩码（与 temp 中 do-operator 一致，无 SE）
         attn_dropout = getattr(args, 'gat_dropout', 0.0)
-        self.gcnLayers = nn.Sequential(
-            *[GraphAttentionConvolution(args.latdim, args.latdim, dropout=attn_dropout) for _ in range(args.gnn_layer)]
+        self.gcnLayers = nn.ModuleList(
+            [GraphAttentionConvolution(args.latdim, args.latdim, dropout=attn_dropout) for _ in range(args.gnn_layer)]
         )
-        se_reduction = getattr(args, 'se_reduction', 16)
-        self.seLayer = SELayer(args.latdim, reduction=se_reduction)
         self.classifierLayer = ClassifierLayer()
         self.edgeDropper = SpAdjDropEdge()
 
@@ -146,17 +117,13 @@ class Model(nn.Module):
         self.fusion_layer = GatedConcatFusion(args.latdim)
         print("Gated Concat 融合模块已初始化.")
 
-    def forward(self, adj, keepRate):
-        # 步骤 3: GCN 传播 (结构视图)
+    def forward(self, adj, keepRate, intervention_mask=None):
+        # 步骤 3: GCN 传播 (结构视图)；intervention_mask 为 None 时不做 do 干预
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
 
         for gcn in self.gcnLayers:
-            gcn_emb = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1])
-            se_out = self.seLayer(gcn_emb)
-            adjusted = t.add(gcn_emb, se_out)
-            adjusted1 = t.add(gcn_emb, embedsLst[-1])
-            struct_embeds = t.add(adjusted, adjusted1)
+            struct_embeds = gcn(self.edgeDropper(adj, keepRate), embedsLst[-1], intervention_mask)
             embedsLst.append(struct_embeds)
 
         final_struct_embeds = sum(embedsLst)
@@ -179,11 +146,7 @@ class Model(nn.Module):
         struct_embeds = t.concat([self.dEmbeds, self.gEmbeds], axis=0)
         embedsLst = [struct_embeds]
         for gcn in self.gcnLayers:
-            gcn_emb = gcn(adj, embedsLst[-1])
-            se_out = self.seLayer(gcn_emb)
-            adjusted = t.add(gcn_emb, se_out)
-            adjusted1 = t.add(gcn_emb, embedsLst[-1])
-            embeds = t.add(adjusted, adjusted1)
+            embeds = gcn(adj, embedsLst[-1], None)
             embedsLst.append(embeds)
         final_struct_embeds = sum(embedsLst)
 
@@ -199,8 +162,8 @@ class Model(nn.Module):
 
         return final_embeds[:args.drug], final_embeds[args.drug:]
 
-    def calcLosses(self, drugs, genes, labels, adj, keepRate):
-        embeds, struct_view, text_view = self.forward(adj, keepRate)
+    def calcLosses(self, drugs, genes, labels, adj, keepRate, intervention_mask=None):
+        embeds, struct_view, text_view = self.forward(adj, keepRate, intervention_mask)
         if self.use_joint_encoding:
             struct_d = struct_view[:args.drug][drugs]
             struct_g = struct_view[args.drug:][genes]
@@ -217,8 +180,8 @@ class Model(nn.Module):
         sslLoss = 0
         return ceLoss, sslLoss
 
-    def predict(self, adj, drugs, genes):
-        embeds, struct_view, _ = self.forward(adj, 1.0)
+    def predict(self, adj, drugs, genes, intervention_mask=None):
+        embeds, struct_view, _ = self.forward(adj, 1.0, intervention_mask)
         if self.use_joint_encoding:
             struct_d = struct_view[:args.drug][drugs]
             struct_g = struct_view[args.drug:][genes]
@@ -235,7 +198,6 @@ class Model(nn.Module):
 
     def getEmbeds(self):
         self.unfreeze(self.gcnLayers)
-        self.unfreeze(self.seLayer)
         return t.concat([self.dEmbeds, self.gEmbeds], axis=0)
 
     def unfreeze(self, layer):
@@ -249,8 +211,11 @@ class Model(nn.Module):
 
 class GraphAttentionConvolution(nn.Module):
     """
-    与 temp.py 中 Causal_GraphConvolution 相同的注意力机制：a、[Wh_i||Wh_j] 式打分 + 邻接掩码 + softmax，
-    用学习到的权重对邻居做不等权聚合。不包含因果干预掩码，也不在注意力之后再乘一遍 adj（单次聚合）。
+    GAT 式注意力：邻接掩码后 softmax 聚合邻居；可选 intervention_mask（do-operator）：
+    mask=0 的位置在 softmax 前置为 -inf，从而切断该条边的注意力权重。
+    Main.Coach.build_intervention_mask 传入时仅对「一跳困难负样本」对应的药–基因对在 N×N 注意力上置零，二跳不干预；
+    训练日志中干预强度按二部 drug×gene 空间对 (drug_idx, gene_idx) 跨 batch 去重后计占比。
+    单次聚合，不再额外 spmm(adj)。
     """
 
     def __init__(self, in_features, out_features, dropout=0.0, score_act=F.relu):
@@ -267,7 +232,7 @@ class GraphAttentionConvolution(nn.Module):
         t.nn.init.xavier_uniform_(self.weight)
         t.nn.init.xavier_uniform_(self.a)
 
-    def forward(self, adj, embeds, flag=True):
+    def forward(self, adj, embeds, intervention_mask=None):
         embeds = F.dropout(embeds, self.dropout, training=self.training)
         Wh = t.mm(embeds, self.weight)
         Wh1 = t.matmul(Wh, self.a[: self.out_features, :])
@@ -278,6 +243,12 @@ class GraphAttentionConvolution(nn.Module):
         zero_vec = -5e4 * t.ones_like(e)
         adj_dense = adj.to_dense() if adj.is_sparse else adj
         attention = t.where(adj_dense > 0, e, zero_vec)
+        if intervention_mask is not None:
+            attention = t.where(
+                intervention_mask > 0,
+                attention,
+                t.full_like(attention, float('-inf')),
+            )
         attention = F.softmax(attention, dim=1)
         attention = F.dropout(attention, self.dropout, training=self.training)
         h_prime = t.matmul(attention, Wh)
