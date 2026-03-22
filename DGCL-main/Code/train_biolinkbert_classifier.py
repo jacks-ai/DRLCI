@@ -34,7 +34,7 @@ def parse_and_extract_custom_args():
     """
     learning_rate = 4e-5  # 默认值
     data = 'DGIdb'  # 默认数据集
-    gpu = 0  # 默认GPU
+    gpu = 1  # 默认GPU
     
     # 解析并移除自定义参数
     new_argv = [sys.argv[0]]  # 保留脚本名
@@ -133,6 +133,10 @@ TRAIN_CONFIG = {
     # 困难负样本 BPR（与 Main.py 思路一致：正样本打分高于困难负样本，加权 sigmoid BPR）
     'bpr_weight': 0.5,             # 与交叉熵协同；可改为 0.5~1.0 加大对比力度
     'bpr_use_cosine_weight': True,  # 用预计算余弦相似度作难度权重（类似 Main 中 neg_weights）
+    # 负样本 BERT 分块前向 + 分次 backward，避免一次性 forward(B×K) 撑爆显存（BioLinkBERT-large）
+    'bpr_neg_chunk_size': 8,       # 每块最多几条 (d,g-) 序列；仍 OOM 可改为 4 或 2
+    # 以时间换显存；对 BERT 再省一截激活，可与 bpr_neg_chunk_size 联用
+    'gradient_checkpointing': True,
 }
 
 # Prompt模板（句子对编码）
@@ -960,6 +964,23 @@ def hard_neg_bpr_loss_from_pools(drug_pos, gene_pos, gene_negs, valid_mask, neg_
     return (bpr * vm).sum() / denom
 
 
+def hard_neg_bpr_contrib_sum_rows(drug_rows, gene_pos_rows, gene_neg_rows, w_rows, use_cosine_weight):
+    """
+    与 hard_neg_bpr_loss_from_pools 同一打分公式，对展平后的 M 条 (batch行, k) 中一小批行求
+    Σ_i (-log σ(s_pos - s_neg))，供分块 backward；w_rows 为与缓存余弦对齐的难度权重。
+    drug_rows / gene_pos_rows / gene_neg_rows: [C, H]；w_rows: [C]
+    """
+    drug_rows = F.normalize(drug_rows, dim=-1)
+    gene_pos_rows = F.normalize(gene_pos_rows, dim=-1)
+    gene_neg_rows = F.normalize(gene_neg_rows, dim=-1)
+    pos_s = (drug_rows * gene_pos_rows).sum(dim=-1)
+    neg_s = (drug_rows * gene_neg_rows).sum(dim=-1)
+    diff = pos_s - neg_s
+    if use_cosine_weight:
+        diff = diff * w_rows.clamp(min=1e-6)
+    return (-F.logsigmoid(diff)).sum()
+
+
 def train_epoch(
     model,
     dataloader,
@@ -987,6 +1008,8 @@ def train_epoch(
 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
+    neg_chunk = int(TRAIN_CONFIG.get('bpr_neg_chunk_size', 8))
+
     for batch_idx, batch in enumerate(progress_bar):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -995,28 +1018,52 @@ def train_epoch(
 
         optimizer.zero_grad()
 
+        loss_bpr_val = 0.0
+        did_bpr = False
+
         if use_fp16:
             with autocast('cuda'):
                 logits, drug_p, gene_p = model(
                     input_ids, attention_mask, token_type_ids, return_pair_pools=True
                 )
                 loss_ce = F.cross_entropy(logits, labels)
-                loss_bpr = loss_ce.new_tensor(0.0)
-                if (
-                    bpr_weight > 0
-                    and tokenizer is not None
-                    and 'hard_neg_genes' in batch
-                ):
-                    hn = batch['hard_neg_genes']
-                    hw = batch['hard_neg_weight']
-                    dix = batch['drug_idx']
-                    valid = hn >= 0
-                    if valid.any():
-                        di_exp = dix.unsqueeze(1).expand_as(hn)[valid]
-                        g_flat = hn[valid]
+
+            need_bpr = (
+                bpr_weight > 0
+                and tokenizer is not None
+                and batch.get('hard_neg_genes') is not None
+            )
+            if need_bpr:
+                hn = batch['hard_neg_genes']
+                hw = batch['hard_neg_weight']
+                dix = batch['drug_idx']
+                valid = hn >= 0
+                if valid.any():
+                    did_bpr = True
+                    B, _ = hn.shape
+                    b_flat = torch.arange(
+                        B, device=valid.device, dtype=torch.long
+                    ).unsqueeze(1).expand_as(hn)[valid]
+                    di_exp = dix.unsqueeze(1).expand_as(hn)[valid]
+                    g_flat = hn[valid]
+                    w_flat = hw[valid].float()
+                    m_total = int(valid.sum().item())
+
+                    scaler.scale(loss_ce).backward(retain_graph=True)
+
+                    bpr_sum_det = 0.0
+                    for s in range(0, m_total, neg_chunk):
+                        e = min(s + neg_chunk, m_total)
+                        b_c = b_flat[s:e].to(device, non_blocking=True)
+                        di_c = di_exp[s:e]
+                        g_c = g_flat[s:e]
+                        w_c = w_flat[s:e]
+
+                        drug_sel = drug_p[b_c]
+                        gene_ps = gene_p[b_c]
                         neg_enc = tokenize_drug_gene_pairs_flat(
-                            di_exp.cpu(),
-                            g_flat.cpu(),
+                            di_c.cpu(),
+                            g_c.cpu(),
                             drug_descriptions,
                             gene_descriptions,
                             drug_ids_global,
@@ -1024,25 +1071,30 @@ def train_epoch(
                             tokenizer,
                             max_length,
                         )
-                        ni = neg_enc['input_ids'].to(device)
-                        na = neg_enc['attention_mask'].to(device)
-                        nt = neg_enc['token_type_ids'].to(device)
-                        _, _, gene_neg = model(ni, na, nt, return_pair_pools=True)
-                        B, K = hn.shape
-                        H = gene_p.size(-1)
-                        gene_negs = logits.new_zeros(B, K, H)
-                        gene_negs[valid.to(device)] = gene_neg
-                        loss_bpr = hard_neg_bpr_loss_from_pools(
-                            drug_p,
-                            gene_p,
-                            gene_negs,
-                            valid.to(device),
-                            hw.to(device),
+                        ni = neg_enc['input_ids'].to(device, non_blocking=True)
+                        na = neg_enc['attention_mask'].to(device, non_blocking=True)
+                        nt = neg_enc['token_type_ids'].to(device, non_blocking=True)
+                        with autocast('cuda'):
+                            _, _, gene_neg = model(ni, na, nt, return_pair_pools=True)
+                        contrib = hard_neg_bpr_contrib_sum_rows(
+                            drug_sel,
+                            gene_ps,
+                            gene_neg,
+                            w_c.to(device, non_blocking=True),
                             bpr_use_cosine_weight,
                         )
-                loss = loss_ce + bpr_weight * loss_bpr
+                        scaler.scale(bpr_weight * contrib / m_total).backward()
+                        bpr_sum_det += float(contrib.detach().item())
 
-            scaler.scale(loss).backward()
+                    loss_bpr_val = bpr_weight * (bpr_sum_det / m_total)
+                    loss_total = float(loss_ce.detach().item()) + loss_bpr_val
+                else:
+                    scaler.scale(loss_ce).backward()
+                    loss_total = float(loss_ce.detach().item())
+            else:
+                scaler.scale(loss_ce).backward()
+                loss_total = float(loss_ce.detach().item())
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN_CONFIG['max_grad_norm'])
             scaler.step(optimizer)
@@ -1052,57 +1104,86 @@ def train_epoch(
                 input_ids, attention_mask, token_type_ids, return_pair_pools=True
             )
             loss_ce = F.cross_entropy(logits, labels)
-            loss_bpr = loss_ce.new_tensor(0.0)
-            if bpr_weight > 0 and tokenizer is not None and 'hard_neg_genes' in batch:
+
+            need_bpr = (
+                bpr_weight > 0
+                and tokenizer is not None
+                and batch.get('hard_neg_genes') is not None
+            )
+            if need_bpr:
                 hn = batch['hard_neg_genes']
                 hw = batch['hard_neg_weight']
                 dix = batch['drug_idx']
                 valid = hn >= 0
                 if valid.any():
+                    did_bpr = True
+                    B, _ = hn.shape
+                    b_flat = torch.arange(
+                        B, device=valid.device, dtype=torch.long
+                    ).unsqueeze(1).expand_as(hn)[valid]
                     di_exp = dix.unsqueeze(1).expand_as(hn)[valid]
                     g_flat = hn[valid]
-                    neg_enc = tokenize_drug_gene_pairs_flat(
-                        di_exp.cpu(),
-                        g_flat.cpu(),
-                        drug_descriptions,
-                        gene_descriptions,
-                        drug_ids_global,
-                        gene_ids_global,
-                        tokenizer,
-                        max_length,
-                    )
-                    ni = neg_enc['input_ids'].to(device)
-                    na = neg_enc['attention_mask'].to(device)
-                    nt = neg_enc['token_type_ids'].to(device)
-                    _, _, gene_neg = model(ni, na, nt, return_pair_pools=True)
-                    B, K = hn.shape
-                    H = gene_p.size(-1)
-                    gene_negs = logits.new_zeros(B, K, H)
-                    gene_negs[valid.to(device)] = gene_neg
-                    loss_bpr = hard_neg_bpr_loss_from_pools(
-                        drug_p,
-                        gene_p,
-                        gene_negs,
-                        valid.to(device),
-                        hw.to(device),
-                        bpr_use_cosine_weight,
-                    )
-            loss = loss_ce + bpr_weight * loss_bpr
+                    w_flat = hw[valid].float()
+                    m_total = int(valid.sum().item())
 
-            loss.backward()
+                    loss_ce.backward(retain_graph=True)
+
+                    bpr_sum_det = 0.0
+                    for s in range(0, m_total, neg_chunk):
+                        e = min(s + neg_chunk, m_total)
+                        b_c = b_flat[s:e].to(device, non_blocking=True)
+                        di_c = di_exp[s:e]
+                        g_c = g_flat[s:e]
+                        w_c = w_flat[s:e]
+
+                        drug_sel = drug_p[b_c]
+                        gene_ps = gene_p[b_c]
+                        neg_enc = tokenize_drug_gene_pairs_flat(
+                            di_c.cpu(),
+                            g_c.cpu(),
+                            drug_descriptions,
+                            gene_descriptions,
+                            drug_ids_global,
+                            gene_ids_global,
+                            tokenizer,
+                            max_length,
+                        )
+                        ni = neg_enc['input_ids'].to(device, non_blocking=True)
+                        na = neg_enc['attention_mask'].to(device, non_blocking=True)
+                        nt = neg_enc['token_type_ids'].to(device, non_blocking=True)
+                        _, _, gene_neg = model(ni, na, nt, return_pair_pools=True)
+                        contrib = hard_neg_bpr_contrib_sum_rows(
+                            drug_sel,
+                            gene_ps,
+                            gene_neg,
+                            w_c.to(device, non_blocking=True),
+                            bpr_use_cosine_weight,
+                        )
+                        (bpr_weight * contrib / m_total).backward()
+                        bpr_sum_det += float(contrib.detach().item())
+
+                    loss_bpr_val = bpr_weight * (bpr_sum_det / m_total)
+                    loss_total = float(loss_ce.detach().item()) + loss_bpr_val
+                else:
+                    loss_ce.backward()
+                    loss_total = float(loss_ce.detach().item())
+            else:
+                loss_ce.backward()
+                loss_total = float(loss_ce.detach().item())
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN_CONFIG['max_grad_norm'])
             optimizer.step()
 
         scheduler.step()
 
-        total_loss += float(loss.item())
+        total_loss += loss_total
         preds = torch.argmax(logits, dim=1)
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.detach().cpu().numpy())
 
-        postfix = {'loss': float(loss.item())}
-        if bpr_weight > 0:
-            postfix['bpr'] = float(loss_bpr.detach().item())
+        postfix = {'loss': loss_total}
+        if did_bpr:
+            postfix['bpr'] = loss_bpr_val
         progress_bar.set_postfix(postfix)
 
     avg_loss = total_loss / max(len(dataloader), 1)
@@ -1263,6 +1344,9 @@ def main():
     
     model = BioLinkBERTClassifier(bert_model, num_classes=14)
     model = model.to(device)
+    if TRAIN_CONFIG.get('gradient_checkpointing'):
+        model.bert.gradient_checkpointing_enable()
+        log_and_print("  ✓ BERT gradient checkpointing 已开启（降低激活显存）", LOG_FILE)
     log_and_print(f"  ✓ 模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M", LOG_FILE)
     
     # 8. 创建数据集和数据加载器
@@ -1295,7 +1379,8 @@ def main():
     log_and_print(f"  ✓ 编码方式: 联合编码 (Drug + Gene)", LOG_FILE)
     log_and_print(f"  ✓ 最大序列长度: {max_length}", LOG_FILE)
     log_and_print(
-        f"  ✓ 损失: 交叉熵 + {TRAIN_CONFIG['bpr_weight']} × 困难负样本 BPR（余弦难度权重: {TRAIN_CONFIG['bpr_use_cosine_weight']}）",
+        f"  ✓ 损失: 交叉熵 + {TRAIN_CONFIG['bpr_weight']} × 困难负样本 BPR"
+        f"（余弦权重: {TRAIN_CONFIG['bpr_use_cosine_weight']}, 负样本分块: {TRAIN_CONFIG.get('bpr_neg_chunk_size', 8)}）",
         LOG_FILE,
     )
     
