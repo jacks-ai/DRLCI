@@ -32,7 +32,7 @@ class GatedConcatFusion(nn.Module):
         return fused_embeds
 
 class JointGatedFusion(nn.Module):
-    """
+    """   JointGatedFusion 会被用上  --use_joint_encoding false才会关掉
     联合编码专用门控层：对 pair 级的 joint 文本向量做特征级门控，
     门控权重由 (struct_d, struct_g, joint_embed) 共同决定。 加了这个门控拟合慢一些了
     """

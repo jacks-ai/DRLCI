@@ -277,9 +277,16 @@ class Coach:
         ret = 'Epoch %d/%d, %s: ' % (ep, args.epoch, name)
         for metric in reses:
             val = reses[metric]
+            # 统一将 loss 等 torch.Tensor 转成可读的数值再打印
+            if t.is_tensor(val):
+                if val.numel() == 1:
+                    val = float(val.detach().item())
+                else:
+                    val = val.detach().cpu().numpy()
+
             # 标量指标按浮点数输出，列表/数组等复杂类型直接转为字符串
             if np.isscalar(val):
-                ret += '%s = %.4f, ' % (metric, val)
+                ret += '%s = %.4f, ' % (metric, float(val))
                 tem = name + metric
                 if save and tem in self.metrics:
                     self.metrics[tem].append(val)
@@ -1476,14 +1483,14 @@ class Coach:
                 # bpr_loss_value = hard_loss_value
                 # bpr_loss_value=hard_loss_value+neg_loss_value*args.common_neg_weight
                 if current_epoch == 0 and i == 0:
-                    print(f"Positive scores shape: {posScores.shape}, mean: {posScores.mean():.4f}")
-                    print(f"Hard negative scores shape: {hard_negScores.shape}, mean: {hard_negScores.mean():.4f}")
-                    print(f"Common negative scores shape: {negScores.shape}, mean: {negScores.mean():.4f}")
-                    print(f"Score difference (scoreDiff1) mean: {scoreDiff1.mean():.4f}")
-                    print(f"Weighted score difference mean: {weighted_scoreDiff1.mean():.4f}")
-                    print(f"Average weight per sample: {neg_weights.mean():.4f}")
-                    print(f"Hard loss: {hard_loss_value:.4f}, Common loss: {neg_loss_value:.4f}")
-                    print(f"Hard loss: {hard_loss_value:.4f}, Common loss: {neg_loss_value:.4f}")
+                    print(f"Positive scores shape: {posScores.shape}, mean: {float(posScores.mean().detach().item()):.4f}")
+                    print(f"Hard negative scores shape: {hard_negScores.shape}, mean: {float(hard_negScores.mean().detach().item()):.4f}")
+                    print(f"Common negative scores shape: {negScores.shape}, mean: {float(negScores.mean().detach().item()):.4f}")
+                    print(f"Score difference (scoreDiff1) mean: {float(scoreDiff1.mean().detach().item()):.4f}")
+                    print(f"Weighted score difference mean: {float(weighted_scoreDiff1.mean().detach().item()):.4f}")
+                    print(f"Average weight per sample: {float(neg_weights.mean().detach().item()):.4f}")
+                    print(f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
+                    print(f"Hard loss: {float(hard_loss_value.detach().item()):.4f}, Common loss: {float(neg_loss_value.detach().item()):.4f}")
 
                 # 梯度累积但分别控制 - 避免损失值差异过大的影响
                 regLoss = calcRegLoss(self.model) * args.reg
@@ -1511,11 +1518,12 @@ class Coach:
                 # 只在第一个batch输出分离式损失信息
                 if i == 0 and (current_epoch == 0):
                     print(f"🔄 Gradient Accumulation Strategy:")
-                    print(f"  Hard loss: {hard_loss_value:.4f}")
-                    print(f"  Common neg loss: {neg_loss_value:.4f} (ratio: {neg_loss_value / hard_loss_value:.1f}x)")
-                    print(f"  Weighted common loss: {neg_loss_value * args.common_neg_weight:.4f}")
-                    print(f"  Total loss: {total_loss:.4f}")
-                    print(f"  Reg loss (split): {regLoss:.4f} (0.5 each)")
+                    print(f"  Hard loss: {float(hard_loss_value.detach().item()):.4f}")
+                    ratio = float((neg_loss_value / (hard_loss_value + 1e-12)).detach().item())
+                    print(f"  Common neg loss: {float(neg_loss_value.detach().item()):.4f} (ratio: {ratio:.1f}x)")
+                    print(f"  Weighted common loss: {float((neg_loss_value * args.common_neg_weight).detach().item()):.4f}")
+                    print(f"  Total loss: {float(total_loss.detach().item()):.4f}")
+                    print(f"  Reg loss (split): {float(regLoss.detach().item()):.4f} (0.5 each)")
 
             # 计算交叉熵损失
             ceLoss, sslLoss = self.get_model().calcLosses(drugs, genes, labels, self.handler.torchBiAdj, args.keepRate)
