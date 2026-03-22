@@ -70,13 +70,21 @@ from DataHandler import DataHandler
 
 # ==================== 路径配置 ====================
 timestamp = datetime.now().strftime("%m%d_%H%M%S")
-save_path = CODE_DIR / f'bert/best_biolinkbert_classifier_{timestamp}.pt'
 DATA_ROOT = PROJECT_ROOT / 'Data' / DATASET_NAME
 MODEL_CACHE = Path(r"/mnt/data/huangpeng/DGCL/mymodel/BioLinkBERT")
-ERROR_CASES_CSV = "/mnt/data/huangpeng/DGCL/DGCL-main/log/0204_233151_DGIdb_error_cases.csv"  # 已注释，改用DataHandler加载测试集
-DRUG_DESC_CSV = DATA_ROOT / 'drug_text' / 'mixed_drug_descriptions.csv'
+DRUG_TEXT_DIR = DATA_ROOT / 'drug_text'
+DRUG_DESC_CANDIDATES = [
+    DRUG_TEXT_DIR / 'mixed_drug_descriptions.csv',
+    DRUG_TEXT_DIR / 'drug_text.json',
+]
+for _candidate in DRUG_DESC_CANDIDATES:
+    if _candidate.exists():
+        DRUG_DESC_PATH = _candidate
+        break
+else:
+    DRUG_DESC_PATH = DRUG_DESC_CANDIDATES[0]
 GENE_DESC_JSON = DATA_ROOT / 'gene_text' / 'gene_embeddings_txt.json'
-GLOBAL_IDS_JSON = DATA_ROOT / 'global_ids.json'
+GLOBAL_IDS_JSON = DATA_ROOT / 'global_ids_2.json'
 LOG_DIR = Path("/mnt/data/huangpeng/DGCL/DGCL-main/Code/bert/blog")  # 日志目录
 LOG_DIR.mkdir(parents=True, exist_ok=True)  # 确保目录存在
 LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
@@ -92,7 +100,7 @@ LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
 TRAIN_CONFIG = {
     'batch_size': 16,              # FP16开启后可增大到 24-32
     'learning_rate': CUSTOM_LEARNING_RATE,  # 从命令行参数读取 (已在文件开头解析)
-    'num_epochs': 12,              # BERT微调推荐: 3-10 epochs
+    'num_epochs': 15,              # BERT微调推荐: 3-10 epochs
     'warmup_ratio': 0.1,           # 预热10%的训练步数
     'max_grad_norm': 1.0,          # 梯度裁剪 (BERT标准: 1.0)
     'weight_decay': 0.01,          # AdamW权重衰减 (BERT标准: 0.01)
@@ -208,9 +216,25 @@ class DrugGeneDataset(Dataset):
         return len(self.labels)
     
     def __getitem__(self, idx):
-        drug_idx = self.drug_ids[idx]
-        gene_idx = self.gene_ids[idx]
+        drug_idx = int(self.drug_ids[idx])
+        gene_idx = int(self.gene_ids[idx])
         label = self.labels[idx]
+        
+        # 越界诊断：在访问前检查并输出详情
+        if drug_idx >= len(self.drug_ids_global):
+            path_resolved = str(GLOBAL_IDS_JSON.resolve()) if hasattr(GLOBAL_IDS_JSON, 'resolve') else str(GLOBAL_IDS_JSON)
+            print(f"\n[越界诊断] drug 索引越界")
+            print(f"  索引文件路径: {path_resolved}")
+            print(f"  drug_ids_global 长度: {len(self.drug_ids_global)}, gene_ids_global 长度: {len(self.gene_ids_global)}")
+            print(f"  样本 idx: {idx}, drug_idx: {drug_idx} (需 < {len(self.drug_ids_global)})")
+            raise IndexError(f"drug_idx {drug_idx} >= len(drug_ids_global) {len(self.drug_ids_global)}")
+        if gene_idx >= len(self.gene_ids_global):
+            path_resolved = str(GLOBAL_IDS_JSON.resolve()) if hasattr(GLOBAL_IDS_JSON, 'resolve') else str(GLOBAL_IDS_JSON)
+            print(f"\n[越界诊断] gene 索引越界")
+            print(f"  索引文件路径: {path_resolved}")
+            print(f"  drug_ids_global 长度: {len(self.drug_ids_global)}, gene_ids_global 长度: {len(self.gene_ids_global)}")
+            print(f"  样本 idx: {idx}, gene_idx: {gene_idx} (需 < {len(self.gene_ids_global)})")
+            raise IndexError(f"gene_idx {gene_idx} >= len(gene_ids_global) {len(self.gene_ids_global)}")
         
         # 获取全局ID
         drug_id = self.drug_ids_global[drug_idx]
@@ -245,15 +269,41 @@ class DrugGeneDataset(Dataset):
 # ==================== 数据加载函数 ====================
 def load_global_ids():
     """加载全局ID映射"""
+    path_resolved = str(GLOBAL_IDS_JSON.resolve()) if hasattr(GLOBAL_IDS_JSON, 'resolve') else str(GLOBAL_IDS_JSON)
+    print(f"[索引文件] 读取路径: {path_resolved}")
     with open(GLOBAL_IDS_JSON, 'r', encoding='utf-8') as f:
         data = json.load(f)
     return data['drug_ids'], data['gene_ids']
 
 
 def load_drug_descriptions():
-    """加载药物描述"""
-    df = pd.read_csv(DRUG_DESC_CSV, encoding='utf-8')
-    return dict(zip(df['DrugID'].astype(str), df['LLM_Text']))
+    """
+    加载药物描述
+
+    支持 JSON 或 CSV 的药物描述映射加载。
+    - JSON: {DrugID: text}
+    - CSV: 支持列组合 ('DrugID','LLM_Text') 或 ('DrugID','LLM_Input_Text')
+    """
+    mapping_path = Path(DRUG_DESC_PATH)
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"找不到药物描述文件: {mapping_path}")
+
+    if mapping_path.suffix.lower() == '.json':
+        with open(mapping_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    if mapping_path.suffix.lower() == '.csv':
+        df = pd.read_csv(mapping_path, encoding='utf-8')
+        candidate_cols = [('DrugID', 'LLM_Text'), ('DrugID', 'LLM_Input_Text')]
+        for id_col, text_col in candidate_cols:
+            if id_col in df.columns and text_col in df.columns:
+                return {
+                    str(row[id_col]): row[text_col]
+                    for _, row in df[[id_col, text_col]].dropna().iterrows()
+                }
+        raise ValueError(f"CSV 文件 {mapping_path} 中找不到支持的列组合 {candidate_cols}")
+
+    raise ValueError(f"不支持的药物描述文件格式: {mapping_path.suffix}")
 
 
 def load_gene_descriptions():
@@ -314,24 +364,6 @@ def load_training_and_test_data():
     print(f"  ✓ 测试标签分布: {np.bincount(test_labels)}")
     
     return train_drugs, train_genes, train_labels, test_drugs, test_genes, test_labels
-
-
-def load_test_data_from_error_cases(drug_ids_global, gene_ids_global):
-    """
-    加载测试数据 (错误案例)
-    """
-    print(f"\n[加载错误案例测试集] 来源: {ERROR_CASES_CSV}")
-    
-    df = pd.read_csv(ERROR_CASES_CSV, encoding='utf-8')
-    df_iter1 = df[df['Iteration'] == 1]
-    
-    error_drugs = df_iter1['药物ID'].values.astype(int)
-    error_genes = df_iter1['基因ID'].values.astype(int)
-    error_labels = df_iter1['真实标签'].values.astype(int)
-    
-    print(f"  ✓ 错误案例数: {len(error_labels)}")
-    
-    return error_drugs, error_genes, error_labels
 
 
 # ==================== 训练和评估函数 ====================
@@ -449,6 +481,8 @@ def main():
     # 1. 加载全局数据
     log_and_print("\n[1/9] 加载全局数据...", LOG_FILE)
     drug_ids_global, gene_ids_global = load_global_ids()
+    path_resolved = str(GLOBAL_IDS_JSON.resolve()) if hasattr(GLOBAL_IDS_JSON, 'resolve') else str(GLOBAL_IDS_JSON)
+    log_and_print(f"  ✓ 索引文件路径: {path_resolved}", LOG_FILE)
     drug_descriptions = load_drug_descriptions()
     gene_descriptions = load_gene_descriptions()
     log_and_print(f"  ✓ 药物数: {len(drug_ids_global)}, 基因数: {len(gene_ids_global)}", LOG_FILE)
@@ -457,9 +491,18 @@ def main():
     log_and_print("\n[2/9] 加载训练数据和测试数据...", LOG_FILE)
     train_drugs, train_genes, train_labels, test_drugs, test_genes, test_labels = load_training_and_test_data()
     
-    # 2.5 加载错误案例测试集
-    log_and_print("\n[2.5/9] 加载错误案例测试集...", LOG_FILE)
-    error_drugs, error_genes, error_labels = load_test_data_from_error_cases(drug_ids_global, gene_ids_global)
+    # 2.1 越界预检查：输出索引范围与 global_ids 长度对比
+    max_train_drug = int(np.max(train_drugs)) if len(train_drugs) > 0 else -1
+    max_train_gene = int(np.max(train_genes)) if len(train_genes) > 0 else -1
+    max_test_drug = int(np.max(test_drugs)) if len(test_drugs) > 0 else -1
+    max_test_gene = int(np.max(test_genes)) if len(test_genes) > 0 else -1
+    log_and_print(f"\n[索引范围检查]", LOG_FILE)
+    log_and_print(f"  drug_ids_global 长度: {len(drug_ids_global)}, gene_ids_global 长度: {len(gene_ids_global)}", LOG_FILE)
+    log_and_print(f"  train: drug_idx 最大 {max_train_drug}, gene_idx 最大 {max_train_gene}", LOG_FILE)
+    log_and_print(f"  test:  drug_idx 最大 {max_test_drug}, gene_idx 最大 {max_test_gene}", LOG_FILE)
+    if max_train_drug >= len(drug_ids_global) or max_train_gene >= len(gene_ids_global) or \
+       max_test_drug >= len(drug_ids_global) or max_test_gene >= len(gene_ids_global):
+        log_and_print(f"  ⚠ 越界: 数据索引超出 global_ids 范围，将报错", LOG_FILE)
     
     # 3. 加载模型和tokenizer
     log_and_print("\n[3/9] 加载BioLinkBERT模型...", LOG_FILE)
@@ -489,20 +532,11 @@ def main():
         drug_ids_global, gene_ids_global, tokenizer, max_length
     )
     
-    # 错误案例测试集
-    error_dataset = DrugGeneDataset(
-        error_drugs, error_genes, error_labels,
-        drug_descriptions, gene_descriptions,
-        drug_ids_global, gene_ids_global, tokenizer, max_length
-    )
-    
     train_loader = DataLoader(train_dataset, batch_size=TRAIN_CONFIG['batch_size'], shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=TRAIN_CONFIG['batch_size'], shuffle=False)
-    error_loader = DataLoader(error_dataset, batch_size=TRAIN_CONFIG['batch_size'], shuffle=False)
     
     log_and_print(f"  ✓ 训练批次数: {len(train_loader)}", LOG_FILE)
     log_and_print(f"  ✓ 官方测试批次数: {len(test_loader)}", LOG_FILE)
-    log_and_print(f"  ✓ 错误案例批次数: {len(error_loader)}", LOG_FILE)
     log_and_print(f"  ✓ 编码方式: 联合编码 (Drug + Gene)", LOG_FILE)
     log_and_print(f"  ✓ 最大序列长度: {max_length}", LOG_FILE)
     
@@ -532,13 +566,14 @@ def main():
     # 6. 训练循环
     log_and_print("\n[6/9] 开始训练...", LOG_FILE)
     best_test_acc = 0.0
-    best_error_acc = 0.0
+    best_epoch = 0
+    best_test_preds = None
+    best_test_labels_eval = None
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     training_start_time = time.time()
     
     # 记录每个epoch的准确率
     official_test_acc_history = []
-    error_cases_acc_history = []
     
     for epoch in range(1, TRAIN_CONFIG['num_epochs'] + 1):
         print(f"\n{'='*60}")
@@ -560,27 +595,22 @@ def main():
         print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}")
         official_test_acc_history.append(test_acc)
         
-        # 在错误案例上评估
-        error_acc, error_top5_acc, error_preds, error_labels_eval = evaluate(model, error_loader, device)
-        print(f"  错误案例集 - Accuracy: {error_acc:.4f}, Top-5 Accuracy: {error_top5_acc:.4f}")
-        error_cases_acc_history.append(error_acc)
-        
-        # 保存最佳模型（基于错误案例集）
-        if error_acc > best_error_acc:
-            best_error_acc = error_acc
-            best_test_acc = test_acc  # 记录此时官方测试集的准确率
-            save_path = CODE_DIR / f'bert/best_biolinkbert_only_{timestamp}.pt'
+        # 保存最佳模型（基于官方测试集）并记录对应的预测结果
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            best_epoch = epoch
+            best_test_preds = test_preds
+            best_test_labels_eval = test_labels_eval
+            save_path = CODE_DIR / f'bert/best_biolinkbert_only_{DATASET_NAME}_{timestamp}.pt'
             torch.save({
                 'epoch': epoch,
                 'bert_state_dict': model.bert.state_dict(),  # 只保存BioLinkBERT模型
                 'test_acc': test_acc,
                 'test_top5_acc': test_top5_acc,
-                'error_acc': error_acc,
-                'error_top5_acc': error_top5_acc,
                 'config': TRAIN_CONFIG,
             }, save_path)
             print(f"  ✓ 保存最佳BioLinkBERT模型 (不含MLP): {save_path}")
-            log_and_print(f"Epoch {epoch}: 保存最佳BioLinkBERT模型 (error_acc={error_acc:.4f}, test_acc={test_acc:.4f})", LOG_FILE)
+            log_and_print(f"Epoch {epoch}: 保存最佳BioLinkBERT模型 (test_acc={test_acc:.4f})", LOG_FILE)
     
     total_training_time = time.time() - training_start_time
     log_and_print(f"\n总训练时间: {total_training_time/60:.1f} 分钟", LOG_FILE)
@@ -592,34 +622,30 @@ def main():
     log_and_print(f"{'='*80}", LOG_FILE)
     
     # 找到最大准确率对应的epoch
-    best_official_epoch = np.argmax(official_test_acc_history) + 1  # +1 因为epoch从1开始
-    best_error_epoch = np.argmax(error_cases_acc_history) + 1
+    best_official_epoch = best_epoch
     
-    log_and_print(f"最佳错误案例准确率: {best_error_acc:.4f} (Epoch {best_error_epoch}) ← 已保存", LOG_FILE)
-    log_and_print(f"对应的官方测试准确率: {best_test_acc:.4f}", LOG_FILE)
-    log_and_print(f"\n官方测试集最佳准确率: {max(official_test_acc_history):.4f} (Epoch {best_official_epoch})", LOG_FILE)
+    log_and_print(f"官方测试集最佳准确率: {best_test_acc:.4f} (Epoch {best_official_epoch})", LOG_FILE)
     
     # 输出每个epoch的准确率历史
     log_and_print(f"\n{'='*80}", LOG_FILE)
     log_and_print("📊 每个Epoch的准确率历史", LOG_FILE)
     log_and_print(f"{'='*80}", LOG_FILE)
     log_and_print(f"官方测试集准确率 (每个epoch): {official_test_acc_history}", LOG_FILE)
-    log_and_print(f"错误案例集准确率 (每个epoch): {error_cases_acc_history}", LOG_FILE)
     log_and_print(f"\n官方测试集最大准确率: {max(official_test_acc_history):.4f} 在 Epoch {best_official_epoch}", LOG_FILE)
-    log_and_print(f"错误案例集最大准确率: {max(error_cases_acc_history):.4f} 在 Epoch {best_error_epoch}", LOG_FILE)
     log_and_print(f"{'='*80}", LOG_FILE)
     
-    # 7.1 官方测试集分类报告
-    print(f"\n{'='*80}")
-    print("📊 官方测试集 - 分类报告")
-    print(f"{'='*80}")
-    print(classification_report(test_labels_eval, test_preds, target_names=INTERACTION_TYPES, zero_division=0))
-    
-    # 7.2 错误案例测试集分类报告
-    print(f"\n{'='*80}")
-    print("📊 错误案例测试集 - 分类报告")
-    print(f"{'='*80}")
-    print(classification_report(error_labels_eval, error_preds, target_names=INTERACTION_TYPES, zero_division=0))
+    # 7.1 官方测试集最佳 Epoch 分类报告（控制台 + 日志）
+    log_and_print(f"\n{'='*80}", LOG_FILE)
+    log_and_print("📊 官方测试集 - 最佳 Epoch 分类报告", LOG_FILE)
+    log_and_print(f"Best Epoch: {best_official_epoch}, Best Acc: {best_test_acc:.4f}", LOG_FILE)
+    log_and_print(f"{'='*80}", LOG_FILE)
+    report = classification_report(
+        best_test_labels_eval,
+        best_test_preds,
+        target_names=INTERACTION_TYPES,
+        zero_division=0
+    )
+    log_and_print(report, LOG_FILE)
     
     # 8. 保存预测结果
     print("\n[8/9] 保存预测结果...")
@@ -633,22 +659,9 @@ def main():
         '是否正确': [pred == label for pred, label in zip(test_preds, test_labels_eval)]
     })
     
-    test_output_file = CODE_DIR / f'biolinkbert_official_test_results_{timestamp}.csv'
+    test_output_file = CODE_DIR / f'biolinkbert_official_test_results_{DATASET_NAME}_{timestamp}.csv'
     test_results_df.to_csv(test_output_file, index=False, encoding='utf-8-sig')
     print(f"  ✓ 官方测试集结果已保存到: {test_output_file}")
-    
-    # 8.2 保存错误案例测试集结果
-    error_results_df = pd.DataFrame({
-        '药物ID': [drug_ids_global[idx] for idx in error_drugs],
-        '基因ID': [gene_ids_global[idx] for idx in error_genes],
-        '真实标签': [INTERACTION_TYPES[label] for label in error_labels_eval],
-        '预测标签': [INTERACTION_TYPES[pred] for pred in error_preds],
-        '是否正确': [pred == label for pred, label in zip(error_preds, error_labels_eval)]
-    })
-    
-    error_output_file = CODE_DIR / f'biolinkbert_error_cases_results_{timestamp}.csv'
-    error_results_df.to_csv(error_output_file, index=False, encoding='utf-8-sig')
-    print(f"  ✓ 错误案例结果已保存到: {error_output_file}")
 
 if __name__ == "__main__":
     main()
