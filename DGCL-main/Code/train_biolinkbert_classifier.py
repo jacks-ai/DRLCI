@@ -131,8 +131,9 @@ TRAIN_CONFIG = {
     'max_length': 512,             # 最大序列长度（联合编码需要更长）
     
     # 困难负样本 BPR（与 Main.py 思路一致：正样本打分高于困难负样本，加权 sigmoid BPR）
-    'bpr_weight': 0.5,             # 与交叉熵协同；可改为 0.5~1.0 加大对比力度
+    'bpr_weight': 1.0,             # 与交叉熵协同；可改为 0.5~1.0 加大对比力度
     'bpr_use_cosine_weight': False,  # 用预计算余弦相似度作难度权重（类似 Main 中 neg_weights）
+    'bpr_l2_normalize': False,       # False 时与 Main.py 一致：打分前不做 L2 归一化
     # 负样本 BERT 分块前向 + 分次 backward，避免一次性 forward(B×K) 撑爆显存（BioLinkBERT-large）
     'bpr_neg_chunk_size': 8,       # 每块最多几条 (d,g-) 序列；仍 OOM 可改为 4 或 2
     # 以时间换显存；对 BERT 再省一截激活，可与 bpr_neg_chunk_size 联用
@@ -945,14 +946,23 @@ def tokenize_drug_gene_pairs_flat(
     }
 
 
-def hard_neg_bpr_loss_from_pools(drug_pos, gene_pos, gene_negs, valid_mask, neg_weights, use_cosine_weight):
+def hard_neg_bpr_loss_from_pools(
+    drug_pos,
+    gene_pos,
+    gene_negs,
+    valid_mask,
+    neg_weights,
+    use_cosine_weight,
+    use_l2_normalize=False,
+):
     """
     Main.py 风格 BPR：posScore = <drug,g+>, negScore_k = <drug,g_k^->（段池化后 L2 归一化再点积）。
     valid_mask / neg_weights: [B, K]；无效位置不计入 loss。
     """
-    drug_pos = F.normalize(drug_pos, dim=-1)
-    gene_pos = F.normalize(gene_pos, dim=-1)
-    gene_negs = F.normalize(gene_negs, dim=-1)
+    if use_l2_normalize:
+        drug_pos = F.normalize(drug_pos, dim=-1)
+        gene_pos = F.normalize(gene_pos, dim=-1)
+        gene_negs = F.normalize(gene_negs, dim=-1)
     pos_scores = (drug_pos * gene_pos).sum(dim=-1, keepdim=True)
     neg_scores = (drug_pos.unsqueeze(1) * gene_negs).sum(dim=-1)
     score_diff = pos_scores - neg_scores
@@ -964,15 +974,23 @@ def hard_neg_bpr_loss_from_pools(drug_pos, gene_pos, gene_negs, valid_mask, neg_
     return (bpr * vm).sum() / denom
 
 
-def hard_neg_bpr_contrib_sum_rows(drug_rows, gene_pos_rows, gene_neg_rows, w_rows, use_cosine_weight):
+def hard_neg_bpr_contrib_sum_rows(
+    drug_rows,
+    gene_pos_rows,
+    gene_neg_rows,
+    w_rows,
+    use_cosine_weight,
+    use_l2_normalize=False,
+):
     """
     与 hard_neg_bpr_loss_from_pools 同一打分公式，对展平后的 M 条 (batch行, k) 中一小批行求
     Σ_i (-log σ(s_pos - s_neg))，供分块 backward；w_rows 为与缓存余弦对齐的难度权重。
     drug_rows / gene_pos_rows / gene_neg_rows: [C, H]；w_rows: [C]
     """
-    drug_rows = F.normalize(drug_rows, dim=-1)
-    gene_pos_rows = F.normalize(gene_pos_rows, dim=-1)
-    gene_neg_rows = F.normalize(gene_neg_rows, dim=-1)
+    if use_l2_normalize:
+        drug_rows = F.normalize(drug_rows, dim=-1)
+        gene_pos_rows = F.normalize(gene_pos_rows, dim=-1)
+        gene_neg_rows = F.normalize(gene_neg_rows, dim=-1)
     pos_s = (drug_rows * gene_pos_rows).sum(dim=-1)
     neg_s = (drug_rows * gene_neg_rows).sum(dim=-1)
     diff = pos_s - neg_s
@@ -1082,6 +1100,7 @@ def train_epoch(
                             gene_neg,
                             w_c.to(device, non_blocking=True),
                             bpr_use_cosine_weight,
+                            TRAIN_CONFIG.get('bpr_l2_normalize', False),
                         )
                         # 多块 BPR 共用同一正样本前向的 drug_p/gene_p，除最后一块外须 retain_graph
                         scaler.scale(bpr_weight * contrib / m_total).backward(
@@ -1161,6 +1180,7 @@ def train_epoch(
                             gene_neg,
                             w_c.to(device, non_blocking=True),
                             bpr_use_cosine_weight,
+                            TRAIN_CONFIG.get('bpr_l2_normalize', False),
                         )
                         (bpr_weight * contrib / m_total).backward(retain_graph=e < m_total)
                         bpr_sum_det += float(contrib.detach().item())
@@ -1383,7 +1403,7 @@ def main():
     log_and_print(f"  ✓ 最大序列长度: {max_length}", LOG_FILE)
     log_and_print(
         f"  ✓ 损失: 交叉熵 + {TRAIN_CONFIG['bpr_weight']} × 困难负样本 BPR"
-        f"（余弦权重: {TRAIN_CONFIG['bpr_use_cosine_weight']}, 负样本分块: {TRAIN_CONFIG.get('bpr_neg_chunk_size', 8)}）",
+        f"（余弦权重: {TRAIN_CONFIG['bpr_use_cosine_weight']}, L2归一化: {TRAIN_CONFIG.get('bpr_l2_normalize', False)}, 负样本分块: {TRAIN_CONFIG.get('bpr_neg_chunk_size', 8)}）",
         LOG_FILE,
     )
     
