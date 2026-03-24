@@ -98,7 +98,7 @@ ALL_GENE_EMBED_CACHE = RAG_GENE_CACHE_DIR / "pretrained_all_gene_cls.npz"
 HARD_NEG_TOP_K = 5
 # 变长困难负样本（非固定 5 列）；若仍使用旧版 train_hard_neg_similar_top5.npz 请删除后重跑
 TRAIN_HARD_NEG_CACHE = RAG_GENE_CACHE_DIR / "train_hard_neg_similar_varlen.npz"
-# 微调后最佳模型保存目录（文件名含 test ACC×1000 四舍五入，如 0.9469 → 947）
+# 微调后最佳模型保存目录（文件名保留 acc 标签，但每次训练只保留一个最佳文件）
 BERT_SAVE_DIR = SERVER_DATA_ROOT / DATASET_NAME / "rag" / "bert"
 GENE_ENTITY_MAX_CHARS = 220  # 与联合编码中基因描述截断一致
 GENE_ENCODE_BATCH = 32
@@ -106,7 +106,7 @@ GENE_ENCODE_MAX_LENGTH = 256  # 单句基因编码，短于联合 512
 # 全基因相似度矩阵 S=EE^T 的内存上限（约 bytes），超出则报错提示减小规模或换机
 MAX_SIM_MATRIX_BYTES = int(3.0 * (1024**3))
 
-LOG_DIR = Path("/mnt/data/huangpeng/DGCL/DGCL-main/Code/bert/blog")  # 日志目录
+LOG_DIR = Path("/mnt/data/huangpeng/DGCL/DGCL-main/Data/DGIdb/rag/bert/log")  # 日志目录
 LOG_DIR.mkdir(parents=True, exist_ok=True)  # 确保目录存在
 LOG_FILE = LOG_DIR / f"training_log_{timestamp}.txt"  # 日志文件
 
@@ -132,7 +132,7 @@ TRAIN_CONFIG = {
     
     # 困难负样本 BPR（与 Main.py 思路一致：正样本打分高于困难负样本，加权 sigmoid BPR）
     'bpr_weight': 0.5,             # 与交叉熵协同；可改为 0.5~1.0 加大对比力度
-    'bpr_use_cosine_weight': True,  # 用预计算余弦相似度作难度权重（类似 Main 中 neg_weights）
+    'bpr_use_cosine_weight': False,  # 用预计算余弦相似度作难度权重（类似 Main 中 neg_weights）
     # 负样本 BERT 分块前向 + 分次 backward，避免一次性 forward(B×K) 撑爆显存（BioLinkBERT-large）
     'bpr_neg_chunk_size': 8,       # 每块最多几条 (d,g-) 序列；仍 OOM 可改为 4 或 2
     # 以时间换显存；对 BERT 再省一截激活，可与 bpr_neg_chunk_size 联用
@@ -1083,7 +1083,10 @@ def train_epoch(
                             w_c.to(device, non_blocking=True),
                             bpr_use_cosine_weight,
                         )
-                        scaler.scale(bpr_weight * contrib / m_total).backward()
+                        # 多块 BPR 共用同一正样本前向的 drug_p/gene_p，除最后一块外须 retain_graph
+                        scaler.scale(bpr_weight * contrib / m_total).backward(
+                            retain_graph=e < m_total
+                        )
                         bpr_sum_det += float(contrib.detach().item())
 
                     loss_bpr_val = bpr_weight * (bpr_sum_det / m_total)
@@ -1159,7 +1162,7 @@ def train_epoch(
                             w_c.to(device, non_blocking=True),
                             bpr_use_cosine_weight,
                         )
-                        (bpr_weight * contrib / m_total).backward()
+                        (bpr_weight * contrib / m_total).backward(retain_graph=e < m_total)
                         bpr_sum_det += float(contrib.detach().item())
 
                     loss_bpr_val = bpr_weight * (bpr_sum_det / m_total)
@@ -1414,6 +1417,9 @@ def main():
     best_test_preds = None
     best_test_labels_eval = None
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    # 训练过程中只保留一个“acc 最佳”模型（文件名含 acc，提升时删除旧文件）
+    BERT_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    best_save_path = None
     training_start_time = time.time()
     
     # 记录每个epoch的准确率
@@ -1447,10 +1453,18 @@ def main():
         epoch_time = time.time() - epoch_start_time
         
         print(f"  训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s")
+        log_and_print(
+            f"Epoch {epoch}: 训练 - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, 耗时: {epoch_time:.1f}s",
+            LOG_FILE,
+        )
 
         # 在官方测试集上评估
         test_acc, test_top5_acc, test_preds, test_labels_eval = evaluate(model, test_loader, device)
         print(f"  官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}")
+        log_and_print(
+            f"Epoch {epoch}: 官方测试集 - Accuracy: {test_acc:.4f}, Top-5 Accuracy: {test_top5_acc:.4f}",
+            LOG_FILE,
+        )
         official_test_acc_history.append(test_acc)
         
         # 保存最佳模型（基于官方测试集）并记录对应的预测结果
@@ -1459,12 +1473,10 @@ def main():
             best_epoch = epoch
             best_test_preds = test_preds
             best_test_labels_eval = test_labels_eval
-            BERT_SAVE_DIR.mkdir(parents=True, exist_ok=True)
             acc_tag = int(round(float(test_acc) * 1000))
-            save_path = (
-                BERT_SAVE_DIR
-                / f'best_biolinkbert_{DATASET_NAME}_{timestamp}_acc{acc_tag}.pt'
-            )
+            save_path = BERT_SAVE_DIR / f'best_biolinkbert_{DATASET_NAME}_{timestamp}_acc{acc_tag}.pt'
+            if best_save_path is not None and best_save_path != save_path and best_save_path.exists():
+                best_save_path.unlink()
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -1475,9 +1487,10 @@ def main():
                 'acc_filename_tag': acc_tag,
                 'config': TRAIN_CONFIG,
             }, save_path)
-            print(f"  ✓ 保存最佳模型（含分类头）: {save_path}")
+            best_save_path = save_path
+            print(f"  ✓ 保存最佳模型（含分类头，仅保留当前最佳）: {save_path} (acc_tag={acc_tag})")
             log_and_print(
-                f"Epoch {epoch}: 保存最佳模型 test_acc={test_acc:.4f} → 文件名 acc{acc_tag}",
+                f"Epoch {epoch}: 保存最佳模型（仅保留当前最佳）test_acc={test_acc:.4f}, acc_tag={acc_tag}, file={save_path}",
                 LOG_FILE,
             )
     
