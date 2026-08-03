@@ -38,9 +38,11 @@ python Main.py --data DGIdb
 ```
 * LINCS L1000
 ```bash
-python Main.py --data LINCS 
+python Main.py --data LINCS
+```
 
-## web tool
+## 4. web tool
+
 http://8.148.158.242:8501/
 Single Prediction : Upon opening the web link, users land on the Single Prediction home page. Here, users can enter a Drug ID and a Gene ID to obtain the interaction predicted by the DRLCI framework. The page displays the predicted probability distribution across interaction categories, enabling convenient inspection of individual drug–gene pairs.
 
