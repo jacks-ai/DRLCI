@@ -44,6 +44,7 @@ python Main.py --data LINCS
 ## 4. web tool
 
 http://8.148.158.242:8501/
+
 Single Prediction : Upon opening the web link, users land on the Single Prediction home page. Here, users can enter a Drug ID and a Gene ID to obtain the interaction predicted by the DRLCI framework. The page displays the predicted probability distribution across interaction categories, enabling convenient inspection of individual drug–gene pairs.
 
 Batch Prediction: Users can select an evaluation dataset and perform DRLCI predictions for all drug-gene pairs in the selected dataset. The page summarizes the prediction results, including the numbers of drug-gene pairs, unique drugs, unique genes, and predicted interaction types. The complete prediction results can also be downloaded as a CSV file. In addition, the page automatically constructs an interactive drug-gene interaction knowledge graph based on the top-ranked interaction predicted by DRLCI for each pair. The graph supports zooming, node dragging, and hover-based inspection of entity information, predicted interaction types, and prediction probabilities.
