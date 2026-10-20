@@ -1,7 +1,28 @@
 # DRLCI: Dual-view Representation Learning Framework for Predicting Drug-Gene Interactions via Causal Intervention
 <img width="1713" height="1057" alt="image" src="https://github.com/user-attachments/assets/3e4dc5b9-7368-4df1-8250-f643cfa0db07" />
 
-## 1. Requirements
+## 1. Project Structure
+
+The code and data are organized as follows:
+
+```
+DRLCI-main/
+├── Code/                                # Source code
+│   ├── Main.py                          # Main entry: training, evaluation, cold-start, and metric export
+│   ├── Model_sparse.py                  # DRLCI model: graph encoder, gated structure-text fusion, contrastive loss
+│   ├── DataHandler.py                   # Data loading and interaction graph construction (train/test sets)
+│   ├── Params.py                        # Hyperparameters and command-line arguments
+│   ├── BioLinkBERT-large.py             # Downloads the pretrained BioLinkBERT-large model (text encoder)
+│   ├── train_biolinkbert_classifier.py  # Fine-tunes BioLinkBERT with an MLP head for interaction-type classification
+│   └── Utils/
+│       └── Utils.py                     # Shared utilities: contrastive loss, cross-entropy, regularization
+└── Data/
+    ├── DGIdb/                           # DGIdb dataset
+    ├── DrugBank/                        # DrugBank dataset
+    └── LINCS/                           # LINCS L1000 dataset (external validation)
+```
+
+## 2. Requirements
 
 The main experiment (`Code/Main.py`) requires the following dependencies:
 
@@ -20,7 +41,7 @@ scikit-learn                  1.1.3
 the installed PyTorch and CUDA versions. Weights & Biases (`wandb`) is optional;
 the current main experiment continues normally when it is not installed.
 
-## 2. Datasets
+## 3. Datasets
 
 We utilize three datasets to evaluate DRLCI: DrugBank, DGIdb, and LINCS L1000. The statistics of the three datasets are summarized below.
 
@@ -31,7 +52,7 @@ We utilize three datasets to evaluate DRLCI: DrugBank, DGIdb, and LINCS L1000. T
 | # of interactions | 80924 | 11366 | 20610 |
 | # of types | 2 | 14 | 2 |
 
-## 3. Training and Evaluation
+## 4. Training and Evaluation
 
 Run the following commands from the `Code/` directory (where `Main.py` is located):
 
@@ -60,7 +81,7 @@ python Main.py --data DGIdb --cold true --cold_entity drug
 python Main.py --data DGIdb --cold true --cold_entity gene
 ```
 
-## 4. Baselines
+## 5. Baselines
 
 We compare DRLCI with five state-of-the-art drug–gene interaction prediction methods. Each baseline is run with its official implementation on the DrugBank and DGIdb datasets.
 
@@ -132,7 +153,7 @@ python src/main.py --data drugbank --epoch 500 --gpu 0
 python src/main.py --data dgidb --epoch 500 --gpu 0
 ```
 
-## 5. Experimental Results
+## 6. Experimental Results
 
 We compare DRLCI with the baselines described above on the DGIdb and DrugBank datasets. All metrics are reported as the mean over five folds. The best result in each column is shown in **bold**, and the second best is <u>underlined</u>.
 
@@ -175,7 +196,7 @@ To assess generalization, we further evaluate DRLCI and the baselines under thre
 
 
 
-## 6. Web Tool
+## 7. Web Tool
 
 The DRLCI web tool is available at **http://8.148.158.242:8501/**.
 
