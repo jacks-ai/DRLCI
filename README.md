@@ -17,7 +17,7 @@ DRLCI-main/
 │   ├── Params.py                        # Hyperparameters and command-line arguments
 │   ├── BioLinkBERT-large.py             # Downloads the pretrained BioLinkBERT-large model (text encoder)
 │   ├── train_biolinkbert_classifier.py  # Fine-tunes BioLinkBERT with an MLP head 
-│                                           for interaction-type classification
+│   │                                      for interaction-type classification
 │   └── Utils/
 │       ├── Utils.py                     # Shared utilities: contrastive loss, cross-entropy, regularization
 │       └── TimeLogger.py                # Console logging helpers
