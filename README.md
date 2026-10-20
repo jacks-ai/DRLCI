@@ -7,15 +7,20 @@ The code and data are organized as follows:
 
 ```
 DRLCI-main/
+├── README.md                            # Project documentation: requirements, datasets, 
+├                                          reproduction commands, baselines, results, web tool
 ├── Code/                                # Source code
 │   ├── Main.py                          # Main entry: training, evaluation, cold-start, and metric export
-│   ├── Model_sparse.py                  # DRLCI model: graph encoder, gated structure-text fusion, contrastive loss
+│   ├── Model_sparse.py                  # DRLCI model: graph encoder, gated structure-text fusion, 
+│   │                                      contrastive loss
 │   ├── DataHandler.py                   # Data loading and interaction graph construction (train/test sets)
 │   ├── Params.py                        # Hyperparameters and command-line arguments
 │   ├── BioLinkBERT-large.py             # Downloads the pretrained BioLinkBERT-large model (text encoder)
-│   ├── train_biolinkbert_classifier.py  # Fine-tunes BioLinkBERT with an MLP head for interaction-type classification
+│   ├── train_biolinkbert_classifier.py  # Fine-tunes BioLinkBERT with an MLP head 
+│                                           for interaction-type classification
 │   └── Utils/
-│       └── Utils.py                     # Shared utilities: contrastive loss, cross-entropy, regularization
+│       ├── Utils.py                     # Shared utilities: contrastive loss, cross-entropy, regularization
+│       └── TimeLogger.py                # Console logging helpers
 └── Data/
     ├── DGIdb/                           # DGIdb dataset
     ├── DrugBank/                        # DrugBank dataset
