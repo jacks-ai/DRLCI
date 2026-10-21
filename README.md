@@ -17,7 +17,7 @@ DRLCI-main/
 │   ├── Params.py                        # Hyperparameters and command-line arguments
 │   ├── BioLinkBERT-large.py             # Downloads the pretrained BioLinkBERT-large model (text encoder)
 │   ├── train_biolinkbert_classifier.py  # Fine-tunes BioLinkBERT with an MLP head 
-│   │                                      for interaction-type classification
+│                                           for interaction-type classification
 │   └── Utils/
 │       ├── Utils.py                     # Shared utilities: contrastive loss, cross-entropy, regularization
 │       └── TimeLogger.py                # Console logging helpers
@@ -102,6 +102,15 @@ cd CoSMIG
 CUDA_VISIBLE_DEVICES=0 python main.py --data-name DrugBank --testing --dynamic-train --dynamic-test --dynamic-val --save-results --max-nodes-per-hop 200
 # DGIdb (inductive)
 CUDA_VISIBLE_DEVICES=0 python main.py --data-name DGIdb --testing --mode inductive --dynamic-train --dynamic-test --dynamic-val --save-results --max-nodes-per-hop 200
+```
+
+### IGMC
+*an inductive matrix completion model based on graph neural networks without using any side information. （ICLR 2020）*
+
+```bash
+git clone https://github.com/muhanzhang/IGMC.git
+python Main.py --data-name DGIdb  -testing --ensemble
+python Main.py --data-name DrugBank  -testing --ensemble
 ```
 
 ### DGCL
